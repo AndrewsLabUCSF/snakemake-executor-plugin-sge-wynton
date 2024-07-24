@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "snakemake-executor-plugin-cluster-generic"
+name = "snakemake-executor-plugin-sge-wynton"
 version = "1.0.9"
 description = ""
 authors = ["Johannes Koester <johannes.koester@uni-due.de>"]
@@ -30,3 +30,6 @@ omit = [".*", "*/site-packages/*", "Snakefile"]
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.plugins."snakemake.executor"]
+"sge-wynton" = "snakemake_executor_plugin_sge_wynton"
