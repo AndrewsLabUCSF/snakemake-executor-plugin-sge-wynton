@@ -28,7 +28,7 @@ RESOURCE_MAPPING = {
     "tmpdir": ("tmpdir",),
     "seq_no": ("seq_no",),
     "s_rt": ("s_rt", "soft_runtime", "soft_walltime"),
-    "h_rt": ("h_rt", "time", "runtime", "walltime", 'time_min'),
+    "h_rt": ("h_rt", "time", "runtime", "walltime", "time_min"),
     "s_cpu": ("s_cpu", "soft_cpu"),
     "h_cpu": ("h_cpu", "cpu"),
     "s_data": ("s_data", "soft_data"),
@@ -47,6 +47,7 @@ RESOURCE_MAPPING = {
     "h_fsize": ("h_fsize", "disk_mb", "file_size", "mem_mib"),
 }
 
+
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
     submit_cmd: Optional[str] = field(
@@ -57,8 +58,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
     status_cmd: Optional[str] = field(
-        default="qstat -xml",
-        metadata={"help": "Command for retrieving job status"}
+        default="qstat -xml", metadata={"help": "Command for retrieving job status"}
     )
     cancel_cmd: Optional[str] = field(
         default="qdel",
@@ -73,8 +73,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
     sidecar_cmd: Optional[str] = field(
-        default=None,
-        metadata={"help": "Command for sidecar process."}
+        default=None, metadata={"help": "Command for sidecar process."}
     )
     default_cwd: Optional[bool] = field(
         default=True,
@@ -84,28 +83,22 @@ class ExecutorSettings(ExecutorSettingsBase):
     )
     default_pe: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Parallel environment specification, e.g., 'smp 4'"
-        },
+        metadata={"help": "Parallel environment specification, e.g., 'smp 4'"},
     )
     default_mem_mb: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Memory requirement, e.g., 200"
-        },
+        metadata={"help": "Memory requirement, e.g., 200"},
     )
     default_scratch: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Scratch space requirement, e.g., '50G'"
-        },
+        metadata={"help": "Scratch space requirement, e.g., '50G'"},
     )
     default_time_min: Optional[str] = field(
         default="00:05:00",
-        metadata={
-            "help": "Runtime limit, e.g., '00:05:00'"
-        },
+        metadata={"help": "Runtime limit, e.g., '00:05:00'"},
     )
+
+
 # Required:
 # Specify common settings shared by various executors.
 common_settings = CommonSettings(
@@ -120,13 +113,21 @@ common_settings = CommonSettings(
 
 logger = logging.getLogger(__name__)
 
+
 class Executor(RemoteExecutor):
     def __post_init__(self):
         if not self.workflow.executor_settings.submit_cmd:
-            raise WorkflowError("You have to specify a submit command via --cluster-generic-submit-cmd.")
+            raise WorkflowError(
+                "You have to specify a submit command via --cluster-generic-submit-cmd."
+            )
 
-        if not self.workflow.executor_settings.status_cmd and not self.workflow.storage_settings.assume_common_workdir:
-            raise WorkflowError("If no shared filesystem is used, you have to specify a cluster status command.")
+        if (
+            not self.workflow.executor_settings.status_cmd
+            and not self.workflow.storage_settings.assume_common_workdir
+        ):
+            raise WorkflowError(
+                "If no shared filesystem is used, you have to specify a cluster status command."
+            )
 
         self.sidecar_vars = None
         if self.workflow.executor_settings.sidecar_cmd:
@@ -139,11 +140,11 @@ class Executor(RemoteExecutor):
                 "If no shared filesystem is used, you have to "
                 "specify a cluster status command."
             )
-        
+
         self.status_cmd_kills = []
         self.external_jobid = {}
 
-#get_jobfinished_marker and get_jobfailed_marker, generate filenames for temporary marker files that indicate whether a job has finished successfully or failed.
+    # get_jobfinished_marker and get_jobfailed_marker, generate filenames for temporary marker files that indicate whether a job has finished successfully or failed.
     def get_jobfinished_marker(self, job: JobExecutorInterface) -> str:
         return f".snakemake/tmp/{job.jobid}.finished"
 
@@ -151,18 +152,16 @@ class Executor(RemoteExecutor):
         return f".snakemake/tmp/{job.jobid}.failed"
 
     def run_job(self, job: JobExecutorInterface):
-
         cwd = os.getcwd()
         # Define the log directory path
         log_dir = os.path.join(cwd, "logs")
-        #print(log_dir)
+        # print(log_dir)
         # Ensure the log directory exists
         os.makedirs(log_dir, exist_ok=True)
 
         jobscript = self.get_jobscript(job)
         jobscript_path = os.path.join(log_dir, os.path.basename(jobscript))
         self.write_jobscript(job, jobscript_path)
-        
 
         jobfinished = self.get_jobfinished_marker(job)
         jobfailed = self.get_jobfailed_marker(job)
@@ -175,19 +174,26 @@ class Executor(RemoteExecutor):
                 "jobfailed": jobfailed,
             },
         )
-    
 
         if self.workflow.executor_settings.status_cmd:
             ext_jobid = self.dag.incomplete_external_jobid(job)
             if ext_jobid:
-                self.logger.info(f"Resuming incomplete job {job.jobid} with external jobid '{ext_jobid}'.")
+                self.logger.info(
+                    f"Resuming incomplete job {job.jobid} with external jobid '{ext_jobid}'."
+                )
                 self.external_jobid.update((f, ext_jobid) for f in job.output)
-                self.report_job_submission(SubmittedJobInfo(job, external_jobid=ext_jobid))
+                self.report_job_submission(
+                    SubmittedJobInfo(job, external_jobid=ext_jobid)
+                )
                 return
 
-        deps = " ".join(self.external_jobid[f] for f in job.input if f in self.external_jobid)
+        deps = " ".join(
+            self.external_jobid[f] for f in job.input if f in self.external_jobid
+        )
         try:
-            submitcmd = job.format_wildcards(self.workflow.executor_settings.submit_cmd, dependencies=deps)
+            submitcmd = job.format_wildcards(
+                self.workflow.executor_settings.submit_cmd, dependencies=deps
+            )
         except AttributeError as e:
             raise WorkflowError(str(e), rule=job.rule if not job.is_group() else None)
 
@@ -195,25 +201,24 @@ class Executor(RemoteExecutor):
         if self.workflow.executor_settings.default_cwd:
             resource_options.append("-cwd")
 
-        #self.logger.info(f"Job {job.jobid} attributes: {vars(job)}")
+        # self.logger.info(f"Job {job.jobid} attributes: {vars(job)}")
 
         resources = job.resources
-        #print(resources)
+        # print(resources)
         self.logger.info(f"Job {job.jobid} resources: {resources}")
 
         # Use job.threads for parallel environment
         if job.threads:
             resource_options.append(f"-pe smp {job.threads}")
 
-
         # Extract resources using RESOURCE_MAPPING and handle unmapped resources
         for resource_key, value in resources.items():
-            # Skip adding threads, _cores, and _nodes as unmapped resources for redundancy still need to figure out _cores and _nodes 
+            # Skip adding threads, _cores, and _nodes as unmapped resources for redundancy still need to figure out _cores and _nodes
             if resource_key in ["threads", "_cores", "_nodes"]:
                 continue
-            #self.logger.info(f"Checking resource_key: {resource_key} with value: {value}")
+            # self.logger.info(f"Checking resource_key: {resource_key} with value: {value}")
             if value in ["<TBD>", None, ""]:
-                #self.logger.info(f"Skipping resource_key: {resource_key} with invalid value: {value}")
+                # self.logger.info(f"Skipping resource_key: {resource_key} with invalid value: {value}")
                 continue
             mapped = False
             for qsub_option, resource_keys in RESOURCE_MAPPING.items():
@@ -225,7 +230,9 @@ class Executor(RemoteExecutor):
                         value = f"{value // 60:02}:{value % 60:02}:00"
                     resource_option = f"-l {qsub_option}={value}"
                     resource_options.append(resource_option)
-                    self.logger.info(f"Adding mapped resource option: {resource_option}")
+                    self.logger.info(
+                        f"Adding mapped resource option: {resource_option}"
+                    )
                     mapped = True
                     break
             if not mapped:
@@ -237,10 +244,14 @@ class Executor(RemoteExecutor):
         if "scratch" in resources:
             resource_options.append(f"-l scratch={resources['scratch']}")
         elif self.workflow.executor_settings.default_scratch:
-            resource_options.append(f"-l scratch={self.workflow.executor_settings.default_scratch}")
+            resource_options.append(
+                f"-l scratch={self.workflow.executor_settings.default_scratch}"
+            )
 
         # Log the resource options
-        self.logger.info(f"Submitting job {job.jobid} with resource options: {resource_options}")
+        self.logger.info(
+            f"Submitting job {job.jobid} with resource options: {resource_options}"
+        )
 
         resource_str = " ".join(resource_options)
         print(resource_str)
@@ -253,7 +264,7 @@ class Executor(RemoteExecutor):
 
             env.pop("SNAKEMAKE_PROFILE", None)
 
-            self.logger.info(f"Executing command: {submitcmd} \"{jobscript_path}\"")
+            self.logger.info(f'Executing command: {submitcmd} "{jobscript_path}"')
             submit_output = subprocess.check_output(
                 f'{submitcmd} "{jobscript_path}"',
                 shell=True,
@@ -274,24 +285,29 @@ class Executor(RemoteExecutor):
 
             self.external_jobid.update((f, ext_jobid) for f in job.output)
 
-            self.logger.info(f"Submitted {'group job' if job.is_group() else 'job'} {job.jobid} with external jobid '{ext_jobid}'.")
+            self.logger.info(
+                f"Submitted {'group job' if job.is_group() else 'job'} {job.jobid} with external jobid '{ext_jobid}'."
+            )
 
         self.report_job_submission(job_info)
 
-    async def check_active_jobs(self, active_jobs: List[SubmittedJobInfo]) -> AsyncGenerator[SubmittedJobInfo, None]:
+    async def check_active_jobs(
+        self, active_jobs: List[SubmittedJobInfo]
+    ) -> AsyncGenerator[SubmittedJobInfo, None]:
         job_ids = [job.external_jobid for job in active_jobs]
         if not job_ids:
             return
-        
+
         job_id_str = ",".join(job_ids)
         try:
             status_output = subprocess.check_output(
-                f"qstat -xml -j {job_id_str}",
-                shell=True
+                f"qstat -xml -j {job_id_str}", shell=True
             ).decode()
             root = ET.fromstring(status_output)
             for job in active_jobs:
-                job_state = root.find(f".//job_list[JB_job_number='{job.external_jobid}']/state")
+                job_state = root.find(
+                    f".//job_list[JB_job_number='{job.external_jobid}']/state"
+                )
                 if job_state is not None:
                     state = job_state.text
                     if state in ("r", "t"):
