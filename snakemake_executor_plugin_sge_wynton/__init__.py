@@ -3,6 +3,7 @@ __copyright__ = "Copyright 2023, Johannes Köster, Manuel Holtgrewe"
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
+import pandas as pd
 from dataclasses import dataclass, field
 import xml.etree.ElementTree as ET
 from time import sleep
@@ -10,7 +11,11 @@ import os
 import subprocess
 import logging
 import re
+import shutil
+import contextlib
 from typing import AsyncGenerator, List, Optional
+from snakemake.deployment.conda import Conda
+from snakemake.shell import shell
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
@@ -18,7 +23,11 @@ from snakemake_interface_executor_plugins.settings import (
     ExecutorSettingsBase,
     CommonSettings,
 )
+import yaml
+from snakemake_interface_executor_plugins.workflow import WorkflowExecutorInterface
+from snakemake_interface_executor_plugins.logging import LoggerExecutorInterface
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
+
 
 RESOURCE_MAPPING = {
     "qname": ("qname",),
@@ -42,9 +51,9 @@ RESOURCE_MAPPING = {
     "slots": ("slots",),
     "s_vmem": ("s_vmem", "soft_memory", "soft_virtual_memory"),
     "h_vmem": ("h_vmem", "mem", "memory", "virtual_memory"),
-    "mem_free": ("mem_mb",),
+    "mem_free": ("mem_mb","mem_mib"),
     "s_fsize": ("s_fsize", "soft_file_size"),
-    "h_fsize": ("h_fsize", "disk_mb", "file_size", "mem_mib"),
+    "h_fsize": ("h_fsize", "disk_mb", "file_size", "disk_mib"),
 }
 
 
@@ -112,13 +121,19 @@ common_settings = CommonSettings(
 )
 
 logger = logging.getLogger(__name__)
-
+cwd = os.getcwd()
+print(f"Current working directory: {cwd}")
 
 class Executor(RemoteExecutor):
+    """
+   setting specific to SGE
+    """
     def __post_init__(self):
+        self.workflow: WorkflowExecutorInterface
+        self.workflow.executor_settings
         if not self.workflow.executor_settings.submit_cmd:
             raise WorkflowError(
-                "You have to specify a submit command via --cluster-generic-submit-cmd."
+                "You have to specify a submit command via --sge-wynton-submit-cmd."
             )
 
         if (
@@ -144,24 +159,195 @@ class Executor(RemoteExecutor):
         self.status_cmd_kills = []
         self.external_jobid = {}
 
+
     # get_jobfinished_marker and get_jobfailed_marker, generate filenames for temporary marker files that indicate whether a job has finished successfully or failed.
     def get_jobfinished_marker(self, job: JobExecutorInterface) -> str:
         return f".snakemake/tmp/{job.jobid}.finished"
 
     def get_jobfailed_marker(self, job: JobExecutorInterface) -> str:
         return f".snakemake/tmp/{job.jobid}.failed"
+    
+    def parse_snakefile(self, snakefile_path):
+        with open(snakefile_path, 'r') as file:
+            content = file.read()
+        # Extract global variables
+        global_vars = {}
+        global_var_pattern = re.compile(r"(\w+)\s*=\s*(.+)")
+        for match in global_var_pattern.finditer(content):
+            key, value = match.groups()
+            try:
+                global_vars[key] = eval(value)
+            except:
+                global_vars[key] = value.strip("'\"")
+
+        rule_pattern = re.compile(r'rule (\w+):([\s\S]*?)(?=^rule|\Z)', re.MULTILINE)
+        section_pattern = re.compile(r'(\w+):\s*(\[?[\s\S]*?\]?)\s*[,|\n]')
+        #print("Rule pattern: ", rule_pattern)
+        #print("Section pattern: ", section_pattern)
+        
+
+        rules = []
+        
+        for match in rule_pattern.finditer(content):
+            rule_name = match.group(1)
+            rule_content = match.group(2)
+
+            rule = {
+                'name': rule_name,
+                'sections': {}
+            }
+
+            for section_match in section_pattern.finditer(rule_content):
+                section_name = section_match.group(1)
+                section_value = section_match.group(2).strip()
+                try:
+                    rule['sections'][section_name] = eval(section_value)
+                except:
+                    rule['sections'][section_name] = section_value.strip("'")
+
+            rules.append(rule)
+            print(f"Rule: {rule}")
+
+        return global_vars, rules
+    
+    def generate_resource_options(self, job):
+        resource_options = []
+        resources = job.resources.get("resources", {})
+
+    # Check if job.threads is set and use it; otherwise, default to 1
+        if job.threads:
+            resource_options.append(f"-pe smp {job.threads}")
+        else:
+            resource_options.append(f"-pe smp 1")
+        for resource_key, value in resources.items():
+            if resource_key in ["threads", "_cores", "_nodes", "disk_mib", "mem_mib"]:
+                continue
+            if value in ["<TBD>", None, ""]:
+                continue
+
+            mapped = False
+            for qsub_option, resource_keys in RESOURCE_MAPPING.items():
+                if resource_key in resource_keys:
+                    if resource_key == "mem_mb":
+                        value = f"{value / 1024:.2f}G"  # Convert MB to GB
+                    elif resource_key == "time_min" and isinstance(value, int):
+                        # Convert time_min to HH:MM:SS format if necessary
+                        value = f"{value // 60:02}:{value % 60:02}:00"
+                    elif resource_key == "disk_mb":
+                        value = f"{value / 1024:.2f}G"
+                    resource_option = f"-l {qsub_option}={value}"
+                    resource_options.append(resource_option)
+                    mapped = True
+                    break
+            if not mapped:
+                resource_option = f"-l {resource_key}={value}"
+                resource_options.append(resource_option)
+
+        return resource_options
+   
+    def convert_param_name(self, param_name):
+        return param_name.upper()
+    
+
+    def prepare_job_script(self, job:JobExecutorInterface, jobscript_path, global_vars):
+        #script = job.rule.script or job.rule.shellcmd
+        #script_path = os.path.join("workflow", job.rule.script)
+        
+        #jobscript_content = "#!/bin/bash\n"
+        jobscript_content = ""
+        jobscript_content += "#$ -S /bin/Rscript\n"
+        #jobscript_content += "#$ -S /bin/Rscript\n"
+        jobscript_content += "#$ -cwd\n"
+        jobscript_content += "#$ -j y\n"
+        
+        #conda_env_file = job.rule.conda_env if hasattr(job.rule, 'conda_env') else None
+
+        resource_options = self.generate_resource_options(job)
+        jobscript_content += ''.join([f"#$ {opt}\n" for opt in resource_options])
+        jobscript_content += "#$ -r y\n"
+        #jobscript_content += "module load CBI r\n"
+        
+        #jobscript_content += "set -x\n"
+        #jobscript_content += "set +u\n"
+        #jobscript_content += f"source {self.workflow.basedir}/{job.rule.conda_env}\n"
+        #jobscript_content += "set -e\n"
+
+        # Create dictionaries for input, output, params
+        env_vars = {
+            "SNAKEMAKE_INPUT": job.input,
+            "SNAKEMAKE_OUTPUT": job.output,
+            #"SNAKEMAKE_WILDCARDS": job.wildcards_dict,
+            #"SNAKEMAKE_THREADS": job.threads,
+            #"SNAKEMAKE_RULE": job.rule.name,
+            #"SNAKEMAKE_WORKFLOW": self.workflow.workdir_init,
+            #"SNAKEMAKE_PARAMS": job.rule.params
+            #"SNAKEMAKE_WORKFLOW_BASEDIR": self.workflow.basedir
+        }
+        print("env_vars: ", env_vars)
+        # Add environment variables to the job script
+        for prefix, data in env_vars.items():
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    env_var_name = f"{prefix}_{self.convert_param_name(key)}"
+                    if isinstance(value, list):
+                        joined_values = ",".join(map(str, value))
+                        jobscript_content += f"export {env_var_name}={joined_values}\n"
+                    else:
+                        jobscript_content += f"export {env_var_name}={value}\n"
+            elif isinstance(data, list):
+                joined_values = ",".join(map(str, data))
+                jobscript_content += f"export {prefix}={joined_values}\n"
+            else:
+                jobscript_content += f"export {prefix}={data}\n"
+
+        # Handle params separately to export each key-value pair as an environment variable
+        if hasattr(job.rule, 'params') and job.rule.params:
+            if isinstance(job.rule.params, list):
+                for key, value in job.rule.params.items():
+                    #print("ruleP: ",job.rule.params.items())
+                    env_var_name = self.convert_param_name(key)
+                    if isinstance(value, pd.Series):
+                        value = value.iloc[0]
+
+                    jobscript_content += f"export {env_var_name}={value}\n"
+            elif isinstance(job.rule.params, list):
+                for idx, value in enumerate(job.rule.params):
+                    env_var_name = f"SNAKEMAKE_PARAM_{idx}"
+                    jobscript_content += f"export {env_var_name}={value}\n"
+
+        #jobscript_content += f"export SNAKEMAKE_THREADS={job.threads}\n"
+
+
+        script_or_shell = f"{job.rule.shellcmd}\n" if job.rule.shellcmd else f"{self.workflow.basedir}/{job.rule.script}"
+
+        for var, value in global_vars.items():
+            script_or_shell = script_or_shell.replace(f"{{{var}}}", str(value))
+
+        jobscript_content += f"{script_or_shell}\n"
+        #jobscript_content += f"cd {self.workflow.workdir_init}\n"
+
+
+        # Replace placeholders with actual values
+        for key, value in job.wildcards_dict.items():
+            jobscript_content = jobscript_content.replace(f"{{{key}}}", value)
+
+
+        # Write the job script to the specified path
+        with open(jobscript_path, 'w') as jobscript_file:
+            jobscript_file.write(jobscript_content)
+            print(f"Job script written to {jobscript_path}")
 
     def run_job(self, job: JobExecutorInterface):
         cwd = os.getcwd()
-        # Define the log directory path
         log_dir = os.path.join(cwd, "logs")
-        # print(log_dir)
-        # Ensure the log directory exists
         os.makedirs(log_dir, exist_ok=True)
 
         jobscript = self.get_jobscript(job)
-        jobscript_path = os.path.join(log_dir, os.path.basename(jobscript))
-        self.write_jobscript(job, jobscript_path)
+        jobscript_path = os.path.join(job.rule.conda_env, jobscript)
+
+        global_vars, _ = self.parse_snakefile(self.workflow.snakefile)
+        # Use job_args in your logic if necessary
+        self.prepare_job_script(job, jobscript_path, global_vars)
 
         jobfinished = self.get_jobfinished_marker(job)
         jobfailed = self.get_jobfailed_marker(job)
@@ -197,64 +383,8 @@ class Executor(RemoteExecutor):
         except AttributeError as e:
             raise WorkflowError(str(e), rule=job.rule if not job.is_group() else None)
 
-        resource_options = []
-        if self.workflow.executor_settings.default_cwd:
-            resource_options.append("-cwd")
-
-        # self.logger.info(f"Job {job.jobid} attributes: {vars(job)}")
-
-        resources = job.resources
-        # print(resources)
-        self.logger.info(f"Job {job.jobid} resources: {resources}")
-
-        # Use job.threads for parallel environment
-        if job.threads:
-            resource_options.append(f"-pe smp {job.threads}")
-
-        # Extract resources using RESOURCE_MAPPING and handle unmapped resources
-        for resource_key, value in resources.items():
-            # Skip adding threads, _cores, and _nodes as unmapped resources for redundancy still need to figure out _cores and _nodes
-            if resource_key in ["threads", "_cores", "_nodes"]:
-                continue
-            # self.logger.info(f"Checking resource_key: {resource_key} with value: {value}")
-            if value in ["<TBD>", None, ""]:
-                # self.logger.info(f"Skipping resource_key: {resource_key} with invalid value: {value}")
-                continue
-            mapped = False
-            for qsub_option, resource_keys in RESOURCE_MAPPING.items():
-                if resource_key in resource_keys:
-                    if resource_key == "mem_mb":
-                        value = f"{value / 1024:.2f}G"  # Convert MB to GB
-                    elif resource_key == "time_min" and isinstance(value, int):
-                        # Convert time_min to HH:MM:SS format if necessary
-                        value = f"{value // 60:02}:{value % 60:02}:00"
-                    resource_option = f"-l {qsub_option}={value}"
-                    resource_options.append(resource_option)
-                    self.logger.info(
-                        f"Adding mapped resource option: {resource_option}"
-                    )
-                    mapped = True
-                    break
-            if not mapped:
-                resource_option = f"-l {resource_key}={value}"
-                resource_options.append(resource_option)
-                self.logger.info(f"Adding unmapped resource option: {resource_option}")
-
-        # Handle additional resources directly from job.resources
-        if "scratch" in resources:
-            resource_options.append(f"-l scratch={resources['scratch']}")
-        elif self.workflow.executor_settings.default_scratch:
-            resource_options.append(
-                f"-l scratch={self.workflow.executor_settings.default_scratch}"
-            )
-
-        # Log the resource options
-        self.logger.info(
-            f"Submitting job {job.jobid} with resource options: {resource_options}"
-        )
-
+        resource_options = self.generate_resource_options(job)
         resource_str = " ".join(resource_options)
-        print(resource_str)
         submitcmd = f"{submitcmd} {resource_str}"
 
         try:
@@ -263,6 +393,7 @@ class Executor(RemoteExecutor):
                 env["SNAKEMAKE_CLUSTER_SIDECAR_VARS"] = self.sidecar_vars
 
             env.pop("SNAKEMAKE_PROFILE", None)
+
 
             self.logger.info(f'Executing command: {submitcmd} "{jobscript_path}"')
             submit_output = subprocess.check_output(
@@ -282,7 +413,6 @@ class Executor(RemoteExecutor):
 
         if ext_jobid:
             job_info.external_jobid = ext_jobid
-
             self.external_jobid.update((f, ext_jobid) for f in job.output)
 
             self.logger.info(
@@ -290,6 +420,17 @@ class Executor(RemoteExecutor):
             )
 
         self.report_job_submission(job_info)
+
+        log_output_path = os.path.join(log_dir, f"snakejob.{job.rule.name}.{job.jobid}.sh.o{ext_jobid}")
+        log_error_path = os.path.join(log_dir, f"snakejob.{job.rule.name}.{job.jobid}.sh.e{ext_jobid}")
+
+        original_log_output = f"{jobscript}.o{ext_jobid}"
+        original_log_error = f"{jobscript}.e{ext_jobid}"
+
+        if os.path.exists(original_log_output):
+            shutil.move(original_log_output, log_output_path)
+        if os.path.exists(original_log_error):
+            shutil.move(original_log_error, log_error_path)
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
@@ -330,3 +471,4 @@ class Executor(RemoteExecutor):
                 subprocess.check_output(f"qdel {jobids}", shell=True)
             except subprocess.CalledProcessError as e:
                 self.logger.error(f"Failed to cancel jobs: {jobids}")
+
