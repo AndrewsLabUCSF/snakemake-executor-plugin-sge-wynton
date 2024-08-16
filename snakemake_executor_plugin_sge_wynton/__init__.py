@@ -66,7 +66,7 @@ class Executor(RemoteExecutor):
         self.run_uuid = str(uuid.uuid4())
         self._fallback_project_arg = None
         self._fallback_queue = None
-        self.sge_config = self.get_sge_config()
+        self.sge_config = {}
 
 
     def run_job(self, job: JobExecutorInterface):
@@ -103,7 +103,7 @@ class Executor(RemoteExecutor):
             wildcard_str_job = ",".join(
                 [f"{k}={v}" for k, v in wildcard_dict_noslash.items()]
             )
-            jobname = f"Snakemake_{log_folder}:{wildcard_str_job}___({self.run_uuid})"
+            jobname = f"Snakemake_{log_folder}___{wildcard_str_job}___({self.run_uuid})"
         else:
             jobname = f"Snakemake_{log_folder}___({self.run_uuid})"
             wildcard_str = "unique"
@@ -118,7 +118,7 @@ class Executor(RemoteExecutor):
         # we use a run_uuid in the job-name, to allow `--name`-based
         # filtering in the job status checks
 
-        call = f"qsub -o {sge_logfile} -e {sge_logfile} '{jobname}'"
+        call = f"qsub -o {sge_logfile} -e {sge_logfile} -N '{jobname}'"
 
 
         # Extracting time_min and converting if necessary
@@ -154,14 +154,16 @@ class Executor(RemoteExecutor):
         call += self.get_project_arg(job)
         call += self.get_queue_arg(job)
 
-        exec_job = self.format_job_exec(job)
+        exec_job = self.format_job_exec(job).replace("'", r"\'")
+        jobscript = self.get_jobscript(job)
+        self.write_jobscript(job, jobscript)
 
         # ensure that workdir is set correctly
-        call += f" -cwd {self.workflow.workdir_init} '{exec_job}'"
+        call += f" -cwd {jobscript}"
         # and finally the job to execute with all the snakemake parameters
         # TODO do I need an equivalent to --wrap?
         #call += f' "{exec_job}"'
-        print(f"SGE submission command: {call}")
+        #print(f"SGE submission command: {call}")
 
         self.logger.debug(f"qsub call: {call}")
         try:
@@ -172,8 +174,10 @@ class Executor(RemoteExecutor):
             raise WorkflowError(
                 f"sge job submission failed. The error message was {e.output}"
             )
+        
+        print(out)
 
-        sge_jobid = re.search(r"Job <(\d+)>", out)[1]
+        sge_jobid = re.search(r"Your job (\d+) [(]", out)[1]
         if not sge_jobid:
             raise WorkflowError(
                 f"Could not extract sge job ID. The submission message was\n{out}"
@@ -450,26 +454,17 @@ class Executor(RemoteExecutor):
         Returns the memory as an integer.
         """
         # Conversion factors for converting various units to GB
-        conv_fcts = {"K": 1 / (1024**2),  # KB to GB
-                    "M": 1 / 1024,        # MB to GB
-                    "G": 1,               # GB is the base unit
-                    "T": 1024}            # TB to GB
+        
         
         # Get the memory unit from the SGE config, default to MB (M)
-        mem_unit = self.sge_config.get("sge_UNIT_FOR_LIMITS", "M")[0]  # Extract the first character (K, M, G, T)
+        #mem_unit = self.sge_config.get("sge_UNIT_FOR_LIMITS", "M")[0]  # Extract the first character (K, M, G, T)
         
         # Get the conversion factor for the detected memory unit
-        conv_fct = conv_fcts.get(mem_unit, 1)  # Default to 1 (GB)
-
+        #conv_fct = conv_fcts.get(mem_unit, 1)  # Default to 1 (GB)
+        #TODO: mem_mb_per_cpu conversion 
         # Check for various memory fields in the job's resources and convert to GB
-        if job.resources.get("mem_kb") and isinstance(job.resources.mem_kb, (int, float)):
-            mem_gb = job.resources.mem_kb * conv_fct
-        elif job.resources.get("mem_mb") and isinstance(job.resources.mem_mb, (int, float)):
-            mem_gb = job.resources.mem_mb * conv_fct
-        elif job.resources.get("mem_gb") and isinstance(job.resources.mem_gb, (int, float)):
-            mem_gb = job.resources.mem_gb * conv_fct
-        elif job.resources.get("mem_tb") and isinstance(job.resources.mem_tb, (int, float)):
-            mem_gb = job.resources.mem_tb * conv_fct
+        if job.resources.get("mem_mb") and isinstance(job.resources.mem_mb, (int, float)):
+            mem_gb = job.resources.mem_mb / 1024
         else:
             self.logger.warning(
                 "No valid job memory information is given - submitting without memory request. "
@@ -551,6 +546,7 @@ class Executor(RemoteExecutor):
         if no queue is given, checks whether a fallback onto a default
         queue is possible
         """
+    
         if "DEFAULT_QUEUE" in self.sge_config:
             return self.sge_config["DEFAULT_QUEUE"]
         self.logger.warning(
@@ -563,40 +559,6 @@ class Executor(RemoteExecutor):
     
         return ""
 
-    @staticmethod
-    def get_lsf_config():
-        lsf_config_raw = subprocess.run(
-            "badmin showconf mbd", shell=True, capture_output=True, text=True
-        )
-
-        lsf_config_lines = lsf_config_raw.stdout.strip().split("\n")
-        lsf_config_tuples = [tuple(x.strip().split(" = ")) for x in lsf_config_lines]
-        lsf_config = {x[0]: x[1] for x in lsf_config_tuples[1:]}
-        clusters = subprocess.run(
-            "lsclusters", shell=True, capture_output=True, text=True
-        )
-        lsf_config["LSF_CLUSTER"] = clusters.stdout.split("\n")[1].split()[0]
-        lsf_config["LSB_EVENTS"] = (
-            f"{lsf_config['LSB_SHAREDIR']}/{lsf_config['LSF_CLUSTER']}"
-            + "/logdir/lsb.events"
-        )
-        lsb_params_file = (
-            f"{lsf_config['LSF_CONFDIR']}/lsbatch/"
-            f"{lsf_config['LSF_CLUSTER']}/configdir/lsb.params"
-        )
-        with open(lsb_params_file, "r") as file:
-            for line in file:
-                if "=" in line and not line.strip().startswith("#"):
-                    key, value = line.strip().split("=", 1)
-                    if key.strip() == "DEFAULT_QUEUE":
-                        lsf_config["DEFAULT_QUEUE"] = value.split("#")[0].strip()
-                        break
-
-        lsf_config["LSF_MEMFMT"] = os.environ.get(
-            "SNAKEMAKE_LSF_MEMFMT", "percpu"
-        ).lower()
-
-        return lsf_config
 
 
 def walltime_sge_to_generic(w):
