@@ -1,61 +1,29 @@
-__author__ = "Johannes Köster, Manuel Holtgrewe"
-__copyright__ = "Copyright 2023, Johannes Köster, Manuel Holtgrewe"
+__author__ = "Brian Fulton-Howard, David Lähnemann, Johannes Köster, Christian Meesters"
+__copyright__ = (
+    "Copyright 2023, Brian Fulton-Howard, ",
+    "David Lähnemann, ",
+    "Johannes Köster, ",
+    "Christian Meesters",
+)
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
-import pandas as pd
-from dataclasses import dataclass, field
-import xml.etree.ElementTree as ET
-from time import sleep
 import os
-import subprocess
-import logging
 import re
-import shutil
-import contextlib
-from typing import AsyncGenerator, List, Optional
-from snakemake.deployment.conda import Conda
-from snakemake.shell import shell
-from snakemake_interface_common.exceptions import WorkflowError
+import subprocess
+import time
+from dataclasses import dataclass, field
+from typing import List, AsyncGenerator, Optional
+from collections import Counter
+import uuid
+import math
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
-from snakemake_interface_executor_plugins.settings import (
-    ExecutorSettingsBase,
-    CommonSettings,
+from snakemake_interface_executor_plugins.settings import (CommonSettings, ExecutorSettingsBase)
+from snakemake_interface_executor_plugins.jobs import (
+    JobExecutorInterface,
 )
-import yaml
-from snakemake_interface_executor_plugins.workflow import WorkflowExecutorInterface
-from snakemake_interface_executor_plugins.logging import LoggerExecutorInterface
-from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
-
-
-RESOURCE_MAPPING = {
-    "qname": ("qname",),
-    "hostname": ("hostname",),
-    "calendar": ("calendar",),
-    "min_cpu_interval": ("min_cpu_interval",),
-    "tmpdir": ("tmpdir",),
-    "seq_no": ("seq_no",),
-    "s_rt": ("s_rt", "soft_runtime", "soft_walltime"),
-    "h_rt": ("h_rt", "time", "runtime", "walltime", "time_min"),
-    "s_cpu": ("s_cpu", "soft_cpu"),
-    "h_cpu": ("h_cpu", "cpu"),
-    "s_data": ("s_data", "soft_data"),
-    "h_data": ("h_data", "data"),
-    "s_stack": ("s_stack", "soft_stack"),
-    "h_stack": ("h_stack", "stack"),
-    "s_core": ("s_core", "soft_core"),
-    "h_core": ("h_core", "core"),
-    "s_rss": ("s_rss", "soft_resident_set_size"),
-    "h_rss": ("h_rss", "resident_set_size"),
-    "slots": ("slots",),
-    "s_vmem": ("s_vmem", "soft_memory", "soft_virtual_memory"),
-    "h_vmem": ("h_vmem", "mem", "memory", "virtual_memory"),
-    "mem_free": ("mem_mb","mem_mib"),
-    "s_fsize": ("s_fsize", "soft_file_size"),
-    "h_fsize": ("h_fsize", "disk_mb", "file_size", "disk_mib"),
-}
-
+from snakemake_interface_common.exceptions import WorkflowError
 
 @dataclass
 class ExecutorSettings(ExecutorSettingsBase):
@@ -66,409 +34,648 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": True,
         },
     )
-    status_cmd: Optional[str] = field(
-        default="qstat -xml", metadata={"help": "Command for retrieving job status"}
-    )
-    cancel_cmd: Optional[str] = field(
-        default="qdel",
-        metadata={
-            "help": "Command for cancelling jobs. Expected to take one or more jobids as arguments."
-        },
-    )
-    cancel_nargs: int = field(
-        default=20,
-        metadata={
-            "help": "Number of jobids to pass to cancel_cmd. If more are given, cancel_cmd will be called multiple times."
-        },
-    )
-    sidecar_cmd: Optional[str] = field(
-        default=None, metadata={"help": "Command for sidecar process."}
-    )
-    default_cwd: Optional[bool] = field(
-        default=True,
-        metadata={
-            "help": "Submit jobs with the -cwd option (run in current working directory)"
-        },
-    )
-    default_pe: Optional[str] = field(
-        default=None,
-        metadata={"help": "Parallel environment specification, e.g., 'smp 4'"},
-    )
-    default_mem_mb: Optional[str] = field(
-        default=None,
-        metadata={"help": "Memory requirement, e.g., 200"},
-    )
-    default_scratch: Optional[str] = field(
-        default=None,
-        metadata={"help": "Scratch space requirement, e.g., '50G'"},
-    )
-    default_time_min: Optional[str] = field(
-        default="00:05:00",
-        metadata={"help": "Runtime limit, e.g., '00:05:00'"},
-    )
-
 
 # Required:
 # Specify common settings shared by various executors.
 common_settings = CommonSettings(
+    # define whether your executor plugin executes locally
+    # or remotely. In virtually all cases, it will be remote execution
+    # (cluster, cloud, etc.). Only Snakemake's standard execution
+    # plugins (snakemake-executor-plugin-dryrun, snakemake-executor-plugin-local)
+    # are expected to specify False here.
     non_local_exec=True,
+    # Define whether your executor plugin implies that there is no shared
+    # filesystem (True) or not (False).
+    # This is e.g. the case for cloud execution.
     implies_no_shared_fs=False,
     job_deploy_sources=False,
     pass_default_storage_provider_args=True,
     pass_default_resources_args=True,
-    pass_envvar_declarations_to_cmd=True,
+    pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
+    # wait a bit until bjobs has job info available
+    init_seconds_before_status_checks=20,
+    pass_group_args=True,
 )
 
-logger = logging.getLogger(__name__)
-cwd = os.getcwd()
-print(f"Current working directory: {cwd}")
 
+# Required:
+# Implementation of your executor
 class Executor(RemoteExecutor):
-    """
-   setting specific to SGE
-    """
     def __post_init__(self):
-        self.workflow: WorkflowExecutorInterface
-        self.workflow.executor_settings
-        if not self.workflow.executor_settings.submit_cmd:
-            raise WorkflowError(
-                "You have to specify a submit command via --sge-wynton-submit-cmd."
-            )
+        self.run_uuid = str(uuid.uuid4())
+        self._fallback_project_arg = None
+        self._fallback_queue = None
+        self.sge_config = self.get_sge_config()
 
-        if (
-            not self.workflow.executor_settings.status_cmd
-            and not self.workflow.storage_settings.assume_common_workdir
-        ):
-            raise WorkflowError(
-                "If no shared filesystem is used, you have to specify a cluster status command."
-            )
-
-        self.sidecar_vars = None
-        if self.workflow.executor_settings.sidecar_cmd:
-            self._launch_sidecar()
-        if (
-            not self.workflow.executor_settings.status_cmd
-            and not self.workflow.storage_settings.assume_common_workdir
-        ):
-            raise WorkflowError(
-                "If no shared filesystem is used, you have to "
-                "specify a cluster status command."
-            )
-
-        self.status_cmd_kills = []
-        self.external_jobid = {}
-
-
-    # get_jobfinished_marker and get_jobfailed_marker, generate filenames for temporary marker files that indicate whether a job has finished successfully or failed.
-    def get_jobfinished_marker(self, job: JobExecutorInterface) -> str:
-        return f".snakemake/tmp/{job.jobid}.finished"
-
-    def get_jobfailed_marker(self, job: JobExecutorInterface) -> str:
-        return f".snakemake/tmp/{job.jobid}.failed"
-    
-    def parse_snakefile(self, snakefile_path):
-        with open(snakefile_path, 'r') as file:
-            content = file.read()
-        # Extract global variables
-        global_vars = {}
-        global_var_pattern = re.compile(r"(\w+)\s*=\s*(.+)")
-        for match in global_var_pattern.finditer(content):
-            key, value = match.groups()
-            try:
-                global_vars[key] = eval(value)
-            except:
-                global_vars[key] = value.strip("'\"")
-
-        rule_pattern = re.compile(r'rule (\w+):([\s\S]*?)(?=^rule|\Z)', re.MULTILINE)
-        section_pattern = re.compile(r'(\w+):\s*(\[?[\s\S]*?\]?)\s*[,|\n]')
-        #print("Rule pattern: ", rule_pattern)
-        #print("Section pattern: ", section_pattern)
-        
-
-        rules = []
-        
-        for match in rule_pattern.finditer(content):
-            rule_name = match.group(1)
-            rule_content = match.group(2)
-
-            rule = {
-                'name': rule_name,
-                'sections': {}
-            }
-
-            for section_match in section_pattern.finditer(rule_content):
-                section_name = section_match.group(1)
-                section_value = section_match.group(2).strip()
-                try:
-                    rule['sections'][section_name] = eval(section_value)
-                except:
-                    rule['sections'][section_name] = section_value.strip("'")
-
-            rules.append(rule)
-            print(f"Rule: {rule}")
-
-        return global_vars, rules
-    
-    def generate_resource_options(self, job):
-        resource_options = []
-        resources = job.resources.get("resources", {})
-
-    # Check if job.threads is set and use it; otherwise, default to 1
-        if job.threads:
-            resource_options.append(f"-pe smp {job.threads}")
-        else:
-            resource_options.append(f"-pe smp 1")
-        for resource_key, value in resources.items():
-            if resource_key in ["threads", "_cores", "_nodes", "disk_mib", "mem_mib"]:
-                continue
-            if value in ["<TBD>", None, ""]:
-                continue
-
-            mapped = False
-            for qsub_option, resource_keys in RESOURCE_MAPPING.items():
-                if resource_key in resource_keys:
-                    if resource_key == "mem_mb":
-                        value = f"{value / 1024:.2f}G"  # Convert MB to GB
-                    elif resource_key == "time_min" and isinstance(value, int):
-                        # Convert time_min to HH:MM:SS format if necessary
-                        value = f"{value // 60:02}:{value % 60:02}:00"
-                    elif resource_key == "disk_mb":
-                        value = f"{value / 1024:.2f}G"
-                    resource_option = f"-l {qsub_option}={value}"
-                    resource_options.append(resource_option)
-                    mapped = True
-                    break
-            if not mapped:
-                resource_option = f"-l {resource_key}={value}"
-                resource_options.append(resource_option)
-
-        return resource_options
-   
-    def convert_param_name(self, param_name):
-        return param_name.upper()
-    
-
-    def prepare_job_script(self, job:JobExecutorInterface, jobscript_path, global_vars):
-        #script = job.rule.script or job.rule.shellcmd
-        #script_path = os.path.join("workflow", job.rule.script)
-        
-        #jobscript_content = "#!/bin/bash\n"
-        jobscript_content = ""
-        jobscript_content += "#$ -S /bin/Rscript\n"
-        #jobscript_content += "#$ -S /bin/Rscript\n"
-        jobscript_content += "#$ -cwd\n"
-        jobscript_content += "#$ -j y\n"
-        
-        #conda_env_file = job.rule.conda_env if hasattr(job.rule, 'conda_env') else None
-
-        resource_options = self.generate_resource_options(job)
-        jobscript_content += ''.join([f"#$ {opt}\n" for opt in resource_options])
-        jobscript_content += "#$ -r y\n"
-        #jobscript_content += "module load CBI r\n"
-        
-        #jobscript_content += "set -x\n"
-        #jobscript_content += "set +u\n"
-        #jobscript_content += f"source {self.workflow.basedir}/{job.rule.conda_env}\n"
-        #jobscript_content += "set -e\n"
-
-        # Create dictionaries for input, output, params
-        env_vars = {
-            "SNAKEMAKE_INPUT": job.input,
-            "SNAKEMAKE_OUTPUT": job.output,
-            #"SNAKEMAKE_WILDCARDS": job.wildcards_dict,
-            #"SNAKEMAKE_THREADS": job.threads,
-            #"SNAKEMAKE_RULE": job.rule.name,
-            #"SNAKEMAKE_WORKFLOW": self.workflow.workdir_init,
-            #"SNAKEMAKE_PARAMS": job.rule.params
-            #"SNAKEMAKE_WORKFLOW_BASEDIR": self.workflow.basedir
-        }
-        print("env_vars: ", env_vars)
-        # Add environment variables to the job script
-        for prefix, data in env_vars.items():
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    env_var_name = f"{prefix}_{self.convert_param_name(key)}"
-                    if isinstance(value, list):
-                        joined_values = ",".join(map(str, value))
-                        jobscript_content += f"export {env_var_name}={joined_values}\n"
-                    else:
-                        jobscript_content += f"export {env_var_name}={value}\n"
-            elif isinstance(data, list):
-                joined_values = ",".join(map(str, data))
-                jobscript_content += f"export {prefix}={joined_values}\n"
-            else:
-                jobscript_content += f"export {prefix}={data}\n"
-
-        # Handle params separately to export each key-value pair as an environment variable
-        if hasattr(job.rule, 'params') and job.rule.params:
-            if isinstance(job.rule.params, list):
-                for key, value in job.rule.params.items():
-                    #print("ruleP: ",job.rule.params.items())
-                    env_var_name = self.convert_param_name(key)
-                    if isinstance(value, pd.Series):
-                        value = value.iloc[0]
-
-                    jobscript_content += f"export {env_var_name}={value}\n"
-            elif isinstance(job.rule.params, list):
-                for idx, value in enumerate(job.rule.params):
-                    env_var_name = f"SNAKEMAKE_PARAM_{idx}"
-                    jobscript_content += f"export {env_var_name}={value}\n"
-
-        #jobscript_content += f"export SNAKEMAKE_THREADS={job.threads}\n"
-
-
-        script_or_shell = f"{job.rule.shellcmd}\n" if job.rule.shellcmd else f"{self.workflow.basedir}/{job.rule.script}"
-
-        for var, value in global_vars.items():
-            script_or_shell = script_or_shell.replace(f"{{{var}}}", str(value))
-
-        jobscript_content += f"{script_or_shell}\n"
-        #jobscript_content += f"cd {self.workflow.workdir_init}\n"
-
-
-        # Replace placeholders with actual values
-        for key, value in job.wildcards_dict.items():
-            jobscript_content = jobscript_content.replace(f"{{{key}}}", value)
-
-
-        # Write the job script to the specified path
-        with open(jobscript_path, 'w') as jobscript_file:
-            jobscript_file.write(jobscript_content)
-            print(f"Job script written to {jobscript_path}")
 
     def run_job(self, job: JobExecutorInterface):
-        cwd = os.getcwd()
-        log_dir = os.path.join(cwd, "logs")
-        os.makedirs(log_dir, exist_ok=True)
+        # Implement here how to run a job.
+        # You can access the job's resources, etc.
+        # via the job object.
+        # After submitting the job, you have to call
+        # self.report_job_submission(job_info).
+        # with job_info being of type
+        # snakemake_interface_executor_plugins.executors.base.SubmittedJobInfo.
 
-        jobscript = self.get_jobscript(job)
-        jobscript_path = os.path.join(job.rule.conda_env, jobscript)
+        if job.is_group():
+            # use the group name, which is in groupid
+            log_folder = f"group_{job.groupid}"
+            # get all wildcards of all the jobs in the group and
+            # prepend each with job name, as wildcards of same
+            # name can contain different values across jobs
+            wildcard_dict = {
+                f"{j.name}__{k}": v
+                for j in job.jobs
+                for k, v in j.wildcards_dict.items()
+            }
+        else:
+            log_folder = f"rule_{job.name}"
+            wildcard_dict = job.wildcards_dict
 
-        global_vars, _ = self.parse_snakefile(self.workflow.snakefile)
-        # Use job_args in your logic if necessary
-        self.prepare_job_script(job, jobscript_path, global_vars)
+        if wildcard_dict:
+            wildcard_dict_noslash = {
+                k: v.replace("/", "___") for k, v in wildcard_dict.items()
+            }
+            wildcard_str = "..".join(
+                [f"{k}={v}" for k, v in wildcard_dict_noslash.items()]
+            )
+            wildcard_str_job = ",".join(
+                [f"{k}={v}" for k, v in wildcard_dict_noslash.items()]
+            )
+            jobname = f"Snakemake_{log_folder}:{wildcard_str_job}___({self.run_uuid})"
+        else:
+            jobname = f"Snakemake_{log_folder}___({self.run_uuid})"
+            wildcard_str = "unique"
 
-        jobfinished = self.get_jobfinished_marker(job)
-        jobfailed = self.get_jobfailed_marker(job)
-
-        job_info = SubmittedJobInfo(
-            job,
-            aux={
-                "jobscript": jobscript_path,
-                "jobfinished": jobfinished,
-                "jobfailed": jobfailed,
-            },
+        sge_logfile = os.path.abspath(
+            f".snakemake/sge_logs/{log_folder}/{wildcard_str}/{self.run_uuid}.log"
         )
 
-        if self.workflow.executor_settings.status_cmd:
-            ext_jobid = self.dag.incomplete_external_jobid(job)
-            if ext_jobid:
-                self.logger.info(
-                    f"Resuming incomplete job {job.jobid} with external jobid '{ext_jobid}'."
-                )
-                self.external_jobid.update((f, ext_jobid) for f in job.output)
-                self.report_job_submission(
-                    SubmittedJobInfo(job, external_jobid=ext_jobid)
-                )
-                return
+        os.makedirs(os.path.dirname(sge_logfile), exist_ok=True)
 
-        deps = " ".join(
-            self.external_jobid[f] for f in job.input if f in self.external_jobid
+        # generic part of a submission string:
+        # we use a run_uuid in the job-name, to allow `--name`-based
+        # filtering in the job status checks
+
+        call = f"qsub -o {sge_logfile} -e {sge_logfile} '{jobname}'"
+
+
+        # Extracting time_min and converting if necessary
+        time_min = job.resources.get('time_min')
+
+        # Check if time_min is provided as a string in the format HH:MM:SS
+        if isinstance(time_min, str):
+            time_sge = time_min  # Use the time as-is
+        elif isinstance(time_min, (int, float)):
+            # Convert time_min in minutes to HH:MM:SS format
+            hours, minutes = divmod(int(time_min), 60)
+            seconds = int((time_min - int(time_min)) * 60)
+            time_sge = f"{hours:02}:{minutes:02}:{seconds:02}"
+        else:
+            raise WorkflowError("Invalid time_min format. Expected a string 'HH:MM:SS' or a numeric value representing minutes.")
+
+        # Append time to the call in the format 'HH:MM:SS'
+        call += f" -l h_rt={time_sge}"
+        
+        # Additional job submission logic...
+        print(f"Submitting job with h_rt: {time_sge} seconds")
+
+        # Call the get_mem method to get the memory value
+        mem_free = self.get_mem(job)
+
+        # Ensure memory is valid before adding it to the submission call
+        if mem_free is not None:
+            call += f" -l mem_free={mem_free}G"
+
+        call += f" -pe smp {self.get_cpus(job)}"
+
+        
+        call += self.get_project_arg(job)
+        call += self.get_queue_arg(job)
+
+        exec_job = self.format_job_exec(job)
+
+        # ensure that workdir is set correctly
+        call += f" -cwd {self.workflow.workdir_init} '{exec_job}'"
+        # and finally the job to execute with all the snakemake parameters
+        # TODO do I need an equivalent to --wrap?
+        #call += f' "{exec_job}"'
+        print(f"SGE submission command: {call}")
+
+        self.logger.debug(f"qsub call: {call}")
+        try:
+            out = subprocess.check_output(
+                call, shell=True, text=True, stderr=subprocess.STDOUT
+            ).strip()
+        except subprocess.CalledProcessError as e:
+            raise WorkflowError(
+                f"sge job submission failed. The error message was {e.output}"
+            )
+
+        sge_jobid = re.search(r"Job <(\d+)>", out)[1]
+        if not sge_jobid:
+            raise WorkflowError(
+                f"Could not extract sge job ID. The submission message was\n{out}"
+            )
+        sge_logfile = sge_logfile.replace("%J", sge_jobid)
+        self.logger.info(
+            f"Job {job.jobid} has been submitted with sge jobid {sge_jobid} "
+            f"(log: {sge_logfile})."
         )
-        try:
-            submitcmd = job.format_wildcards(
-                self.workflow.executor_settings.submit_cmd, dependencies=deps
+        self.report_job_submission(
+            SubmittedJobInfo(
+                job, external_jobid=sge_jobid, aux={"sge_logfile": sge_logfile}
             )
-        except AttributeError as e:
-            raise WorkflowError(str(e), rule=job.rule if not job.is_group() else None)
-
-        resource_options = self.generate_resource_options(job)
-        resource_str = " ".join(resource_options)
-        submitcmd = f"{submitcmd} {resource_str}"
-
-        try:
-            env = dict(os.environ)
-            if self.sidecar_vars:
-                env["SNAKEMAKE_CLUSTER_SIDECAR_VARS"] = self.sidecar_vars
-
-            env.pop("SNAKEMAKE_PROFILE", None)
-
-
-            self.logger.info(f'Executing command: {submitcmd} "{jobscript_path}"')
-            submit_output = subprocess.check_output(
-                f'{submitcmd} "{jobscript_path}"',
-                shell=True,
-                env=env,
-            ).decode()
-
-            self.logger.info(f"Job submission output: {submit_output}")
-
-            ext_jobid = re.search(r"Your job (\d+)", submit_output).group(1)
-        except subprocess.CalledProcessError as ex:
-            msg = f"Error submitting jobscript (exit code {ex.returncode}):\n{ex.output.decode()}"
-            self.logger.error(msg)
-            self.report_job_error(job_info, msg=msg)
-            return
-
-        if ext_jobid:
-            job_info.external_jobid = ext_jobid
-            self.external_jobid.update((f, ext_jobid) for f in job.output)
-
-            self.logger.info(
-                f"Submitted {'group job' if job.is_group() else 'job'} {job.jobid} with external jobid '{ext_jobid}'."
-            )
-
-        self.report_job_submission(job_info)
-
-        log_output_path = os.path.join(log_dir, f"snakejob.{job.rule.name}.{job.jobid}.sh.o{ext_jobid}")
-        log_error_path = os.path.join(log_dir, f"snakejob.{job.rule.name}.{job.jobid}.sh.e{ext_jobid}")
-
-        original_log_output = f"{jobscript}.o{ext_jobid}"
-        original_log_error = f"{jobscript}.e{ext_jobid}"
-
-        if os.path.exists(original_log_output):
-            shutil.move(original_log_output, log_output_path)
-        if os.path.exists(original_log_error):
-            shutil.move(original_log_error, log_error_path)
+        )
 
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
     ) -> AsyncGenerator[SubmittedJobInfo, None]:
-        job_ids = [job.external_jobid for job in active_jobs]
-        if not job_ids:
-            return
+        # Check the status of active jobs.
 
-        job_id_str = ",".join(job_ids)
-        try:
-            status_output = subprocess.check_output(
-                f"qstat -xml -j {job_id_str}", shell=True
-            ).decode()
-            root = ET.fromstring(status_output)
-            for job in active_jobs:
-                job_state = root.find(
-                    f".//job_list[JB_job_number='{job.external_jobid}']/state"
+        # You have to iterate over the given list active_jobs.
+        # For jobs that have finished successfully, you have to call
+        # self.report_job_success(job).
+        # For jobs that have errored, you have to call
+        # self.report_job_error(job).
+        # Jobs that are still running have to be yielded.
+        #
+        # For queries to the remote middleware, please use
+        # self.status_rate_limiter like this:
+        #
+        # async with self.status_rate_limiter:
+        #    # query remote middleware here
+        fail_stati = ("SSUSP", "EXIT", "USUSP")
+        # Cap sleeping time between querying the status of all active jobs:
+        max_sleep_time = 180
+
+        job_query_durations = []
+
+        status_attempts = 6
+
+        active_jobs_ids = {job_info.external_jobid for job_info in active_jobs}
+        active_jobs_seen = set()
+
+        self.logger.debug("Checking job status")
+
+        for i in range(status_attempts):
+            async with self.status_rate_limiter:
+                (status_of_jobs, job_query_duration) = await self.job_stati_bjobs()
+                job_query_durations.append(job_query_duration)
+                self.logger.debug(f"status_of_jobs after qsub is: {status_of_jobs}")
+                # only take jobs that are still active
+                active_jobs_ids_with_current_status = (
+                    set(status_of_jobs.keys()) & active_jobs_ids
                 )
-                if job_state is not None:
-                    state = job_state.text
-                    if state in ("r", "t"):
-                        yield job
-                    elif state in ("Eqw", "dr", "dt"):
-                        self.report_job_error(job)
-                    else:
-                        self.report_job_success(job)
-                else:
-                    self.report_job_success(job)
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to retrieve job status for jobs: {job_id_str}")
-            for job in active_jobs:
-                self.report_job_error(job)
+                active_jobs_seen = (
+                    active_jobs_seen | active_jobs_ids_with_current_status
+                )
+                missing_status_ever = active_jobs_ids - active_jobs_seen
+                if missing_status_ever and i > 2:
+                    (
+                        status_of_jobs_sgeevt,
+                        job_query_duration,
+                    ) = await self.job_stati_sgeevents()
+                    job_query_durations.append(job_query_duration)
+                    status_of_jobs.update(status_of_jobs_sgeevt)
+                    self.logger.debug(
+                        f"status_of_jobs after sge_EVENTS is: {status_of_jobs}"
+                    )
+                    active_jobs_ids_with_current_status = (
+                        set(status_of_jobs.keys()) & active_jobs_ids
+                    )
+                    active_jobs_seen = (
+                        active_jobs_seen | active_jobs_ids_with_current_status
+                    )
+                missing_status = active_jobs_seen - active_jobs_ids_with_current_status
+                missing_status_ever = active_jobs_ids - active_jobs_seen
+
+                self.logger.debug(f"active_jobs_seen are: {active_jobs_seen}")
+                if not missing_status and not missing_status_ever:
+                    break
+            if i >= status_attempts - 1:
+                self.logger.warning(
+                    f"Unable to get the status of all active_jobs that should be "
+                    f"in sge, even after {status_attempts} attempts.\n"
+                    f"The jobs with the following job ids were previously seen "
+                    "but are no longer reported by bjobs or in sge_EVENTS:\n"
+                    f"{missing_status}\n"
+                    f"Please double-check with your sge cluster administrator, that "
+                    "job accounting is properly set up.\n"
+                )
+
+        any_finished = False
+        for j in active_jobs:
+            if j.external_jobid not in status_of_jobs:
+                yield j
+                continue
+            status = status_of_jobs[j.external_jobid]
+            if status == "DONE":
+                self.report_job_success(j)
+                any_finished = True
+                active_jobs_seen.remove(j.external_jobid)
+            elif status == "UNKWN":
+                # the job probably does not exist anymore, but 'sacct' did not work
+                # so we assume it is finished
+                self.report_job_success(j)
+                any_finished = True
+                active_jobs_seen.remove(j.external_jobid)
+            elif status in fail_stati:
+                msg = (
+                    f"sge-job '{j.external_jobid}' failed, sge status is: "
+                    f"'{status}'"
+                )
+                self.report_job_error(j, msg=msg, aux_logs=[j.aux["sge_logfile"]])
+                active_jobs_seen.remove(j.external_jobid)
+            else:  # still running?
+                yield j
+
+        if not any_finished:
+            self.next_seconds_between_status_checks = min(
+                self.next_seconds_between_status_checks + 10, max_sleep_time
+            )
+        else:
+            self.next_seconds_between_status_checks = None
 
     def cancel_jobs(self, active_jobs: List[SubmittedJobInfo]):
+        # Cancel all active jobs.
+        # This method is called when Snakemake is interrupted.
         if active_jobs:
-            jobids = " ".join([job.external_jobid for job in active_jobs])
+            # TODO chunk jobids in order to avoid too long command lines
+            jobids = " ".join([job_info.external_jobid for job_info in active_jobs])
             try:
-                subprocess.check_output(f"qdel {jobids}", shell=True)
-            except subprocess.CalledProcessError as e:
-                self.logger.error(f"Failed to cancel jobs: {jobids}")
+                # timeout set to 60, because a scheduler cycle usually is
+                # about 30 sec, but can be longer in extreme cases.
+                # Under 'normal' circumstances, 'bkill' is executed in
+                # virtually no time.
+                subprocess.check_output(
+                    f"qdel {jobids}",
+                    text=True,
+                    shell=True,
+                    timeout=60,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.TimeoutExpired:
+                self.logger.warning("Unable to cancel jobs within a minute.")
 
+    async def job_stati_bjobs(self):
+        """
+        Obtain sge job status of all submitted jobs from bjobs
+        """
+        uuid = self.run_uuid
+
+        statuses_all = []
+
+        try:
+            running_cmd = f"qstat -u '*' -s r -j"
+            time_before_query = time.time()
+            running = subprocess.check_output(
+                running_cmd, shell=True, text=True, stderr=subprocess.PIPE
+            )
+            query_duration = time.time() - time_before_query
+            self.logger.debug(
+                "The job status for running jobs was queried "
+                f"with command: {running_cmd}\n"
+                f"It took: {query_duration} seconds\n"
+                f"The output is:\n'{running}'\n"
+            )
+            if running:
+                statuses_all += [tuple(x.split()) for x in running.strip().split("\n")]
+        except subprocess.CalledProcessError as e:
+            self.logger.error(
+                f"The running job status query failed with command: {running_cmd}\n"
+                f"Error message: {e.stderr.strip()}\n"
+            )
+            pass
+
+        res = {x[0]: x[1] for x in statuses_all}
+
+        return (res, query_duration)
+
+    async def job_stati_sgeevents(self):
+        """
+        Obtain sge job status of all submitted jobs from sge_EVENTS
+        """
+        uuid = self.run_uuid
+
+        statuses = {
+            "0": "NULL",  # State null
+            "1": "PEND",  # Job is pending (it has not been dispatched yet).
+            "2": "PSUSP",  # Pending job suspended by owner or sge sysadmin.
+            "4": "RUN",  # Job is running.
+            "8": "SSUSP",  # Running suspended by the system. *
+            "16": "USUSP",  # Running job suspended by owner or sge sysadmin.
+            "32": "EXIT",  # Job terminated with a non-zero status. **
+            "64": "DONE",  # Job has terminated with status 0.
+            "128": "PDONE",  # Post job process done successfully.
+            "256": "PERR",  # Post job process has an error.
+            "512": "WAIT",  # Chunk job waiting its turn to exec.
+            "32768": "RUNKWN",  # Stat unknown (remote cluster contact lost).
+            "65536": "UNKWN",  # Stat unknown (local cluster contact lost). ***
+            "131072": "PROV",  # Job is provisional. ****
+        }
+
+        #   * because execution host was overloaded or queue run window closed.
+        #   ** may have been aborted due to an execution error
+        #      or killed by owner or sge sysadmin.
+        #  *** The server batch daemon (sbatchd) on the host on which the job
+        #      is processed has lost contact with the master batch daemon
+        #      (mbatchd).
+        # **** This state shows that the job is dispatched to a standby
+        #      power-saved host, and this host is being waken up or started up.
+
+        awk_code = f"""
+        awk '
+            BEGIN {{
+                FPAT = "([^ ]+)|(\\"[^\\"]+\\")"
+            }}
+            $1 == "\\"JOB_NEW\\"" && $5 == {os.geteuid()} && $42 ~ "{uuid}" {{
+                a[$4]
+                next
+            }}
+            $4 in a && $1 == "\\"JOB_STATUS\\"" && $5 != 192 {{
+                print $4, $5
+            }}
+        ' {self.sge_config['sge_EVENTS']}
+        """
+
+        statuses_all = []
+
+        try:
+            time_before_query = time.time()
+            finished = subprocess.check_output(
+                awk_code, shell=True, text=True, stderr=subprocess.PIPE
+            )
+            query_duration = time.time() - time_before_query
+            self.logger.debug(
+                f"The job status for completed jobs was queried.\n"
+                f"It took: {query_duration} seconds\n"
+                f"The output is:\n'{finished}'\n"
+            )
+            if finished:
+                codes = [tuple(x.split()) for x in finished.strip().split("\n")]
+                statuses_all += [(x, statuses[y]) for x, y in codes]
+        except subprocess.CalledProcessError as e:
+            self.logger.error(
+                f"The finished job status query failed with command: {awk_code}\n"
+                f"Error message: {e.stderr.strip()}\n"
+            )
+            pass
+
+        res = {x[0]: x[1] for x in statuses_all}
+
+        return (res, query_duration)
+
+    def get_cpus(self, job: JobExecutorInterface):
+        """
+        Gets the sge cpu request amount for the job.
+        """
+        cpus_total = job.threads
+        if job.resources.get("threads"):
+            cpus_per_task = job.resources.threads
+            if not isinstance(cpus_per_task, int):
+                raise WorkflowError(
+                    f"cpus_per_task must be an integer, but is {cpus_per_task}"
+                )
+            cpus_total = cpus_per_task
+        # ensure that at least 1 cpu is requested
+        # because 0 is not allowed by sge
+        return max(1, cpus_total)
+
+    def get_mem(self, job: JobExecutorInterface):
+        """
+        Gets the SGE memory request amount for the job.
+        Converts the memory to gigabytes (GB) from any of the provided units (KB, MB, GB, TB).
+        Returns the memory as an integer.
+        """
+        # Conversion factors for converting various units to GB
+        conv_fcts = {"K": 1 / (1024**2),  # KB to GB
+                    "M": 1 / 1024,        # MB to GB
+                    "G": 1,               # GB is the base unit
+                    "T": 1024}            # TB to GB
+        
+        # Get the memory unit from the SGE config, default to MB (M)
+        mem_unit = self.sge_config.get("sge_UNIT_FOR_LIMITS", "M")[0]  # Extract the first character (K, M, G, T)
+        
+        # Get the conversion factor for the detected memory unit
+        conv_fct = conv_fcts.get(mem_unit, 1)  # Default to 1 (GB)
+
+        # Check for various memory fields in the job's resources and convert to GB
+        if job.resources.get("mem_kb") and isinstance(job.resources.mem_kb, (int, float)):
+            mem_gb = job.resources.mem_kb * conv_fct
+        elif job.resources.get("mem_mb") and isinstance(job.resources.mem_mb, (int, float)):
+            mem_gb = job.resources.mem_mb * conv_fct
+        elif job.resources.get("mem_gb") and isinstance(job.resources.mem_gb, (int, float)):
+            mem_gb = job.resources.mem_gb * conv_fct
+        elif job.resources.get("mem_tb") and isinstance(job.resources.mem_tb, (int, float)):
+            mem_gb = job.resources.mem_tb * conv_fct
+        else:
+            self.logger.warning(
+                "No valid job memory information is given - submitting without memory request. "
+                "This might or might not work on your cluster."
+            )
+            return None  # Return None if there's no valid memory info
+        
+        # Return the memory as an integer (rounded down)
+        return int(mem_gb)
+
+
+
+    def get_project_arg(self, job: JobExecutorInterface):
+        """
+        checks whether the desired project is valid,
+        returns a default project, if applicable
+        else raises an error - implicetly.
+        """
+        if job.resources.get("sge_project"):
+            # No current way to check if the project is valid
+            return f" -P {job.resources.sge_project}"
+        else:
+            return ""
+        """
+        else:
+            if self._fallback_project_arg is None:
+                self.logger.warning("No sge project given, trying to guess.")
+                project = self.get_project()
+                if project:
+                    self.logger.warning(f"Guessed sge project: {project}")
+                    self._fallback_project_arg = f" -P {project}"
+                else:
+                    self.logger.warning(
+                        "Unable to guess sge project. Trying to proceed without."
+                    )
+                    self._fallback_project_arg = ""  # no project specific args for bsub
+            return self._fallback_project_arg
+        """
+    def get_queue_arg(self, job: JobExecutorInterface):
+        """
+        checks whether the desired queue is valid,
+        returns a default queue, if applicable
+        else raises an error - implicetly.
+        """
+        if job.resources.get("sge_queue"):
+            queue = job.resources.sge_queue
+            print("Here is the queue: ", queue)
+        else:
+            if self._fallback_queue is None:
+                self._fallback_queue = self.get_default_queue(job)
+            queue = self._fallback_queue
+        if queue:
+            return f" -q {queue}"
+        else:
+            return ""
+
+    def get_project(self):
+        """
+        tries to deduce the project from recent jobs,
+        returns None, if none is found
+        """
+        cmd = "qacct -j | grep Project"
+        try:
+            qacct_out = subprocess.check_output(
+                cmd, shell=True, text=True, stderr=subprocess.PIPE
+            )
+            projects = re.findall(r"Project\s+(\S+)", qacct_out)
+            counter = Counter(projects)
+            return counter.most_common(1)[0][0] if counter else None
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(
+                f"No project was given, not able to get a sge project from qacct: {e.stderr} "
+                f"{e.stderr}"
+            )
+            return None
+
+    def get_default_queue(self, job):
+        """
+        if no queue is given, checks whether a fallback onto a default
+        queue is possible
+        """
+        if "DEFAULT_QUEUE" in self.sge_config:
+            return self.sge_config["DEFAULT_QUEUE"]
+        self.logger.warning(
+            f"No queue was given for rule '{job}', and unable to find "
+            "a default queue."
+            " Trying to submit without queue information."
+            " You may want to invoke snakemake with --default-resources "
+            "'sge_queue=<your default queue>'."
+        )
+    
+        return ""
+
+    @staticmethod
+    def get_lsf_config():
+        lsf_config_raw = subprocess.run(
+            "badmin showconf mbd", shell=True, capture_output=True, text=True
+        )
+
+        lsf_config_lines = lsf_config_raw.stdout.strip().split("\n")
+        lsf_config_tuples = [tuple(x.strip().split(" = ")) for x in lsf_config_lines]
+        lsf_config = {x[0]: x[1] for x in lsf_config_tuples[1:]}
+        clusters = subprocess.run(
+            "lsclusters", shell=True, capture_output=True, text=True
+        )
+        lsf_config["LSF_CLUSTER"] = clusters.stdout.split("\n")[1].split()[0]
+        lsf_config["LSB_EVENTS"] = (
+            f"{lsf_config['LSB_SHAREDIR']}/{lsf_config['LSF_CLUSTER']}"
+            + "/logdir/lsb.events"
+        )
+        lsb_params_file = (
+            f"{lsf_config['LSF_CONFDIR']}/lsbatch/"
+            f"{lsf_config['LSF_CLUSTER']}/configdir/lsb.params"
+        )
+        with open(lsb_params_file, "r") as file:
+            for line in file:
+                if "=" in line and not line.strip().startswith("#"):
+                    key, value = line.strip().split("=", 1)
+                    if key.strip() == "DEFAULT_QUEUE":
+                        lsf_config["DEFAULT_QUEUE"] = value.split("#")[0].strip()
+                        break
+
+        lsf_config["LSF_MEMFMT"] = os.environ.get(
+            "SNAKEMAKE_LSF_MEMFMT", "percpu"
+        ).lower()
+
+        return lsf_config
+
+
+def walltime_sge_to_generic(w):
+    """
+    convert old sge walltime format to new generic format
+    """
+    s = 0
+    if type(w) in [int, float]:
+        # convert int minutes to hours minutes and seconds
+        return w
+    elif type(w) is str:
+        if re.match(r"^\d+(ms|[smhdw])$", w):
+            return w
+        elif re.match(r"^\d+:\d+$", w):
+            # convert "HH:MM" to hours and minutes
+            h, m = map(float, w.split(":"))
+        elif re.match(r"^\d+:\d+:\d+$", w):
+            # convert "HH:MM:SS" to hours minutes and seconds
+            h, m, s = map(float, w.split(":"))
+        elif re.match(r"^\d+:\d+\.\d+$", w):
+            # convert "HH:MM.XX" to hours minutes and seconds
+            h, m = map(float, w.split(":"))
+            s = (m % 1) * 60
+            m = round(m)
+        elif re.match(r"^\d+\.\d+$", w):
+            return math.ceil(w)
+        elif re.match(r"^\d+$", w):
+            return int(w)
+        else:
+            raise ValueError(f"Invalid walltime format: {w}")
+    h = int(h)
+    m = int(m)
+    s = int(s)
+    return math.ceil((h * 60) + m + (s / 60))
+
+
+def generalize_sge(rules, runtime=True, memory="perthread_to_perjob"):
+    """
+    Convert sge specific resources to generic resources
+    """
+    re_mem = re.compile(r"^([0-9.]+)(B|KB|MB|GB|TB|PB|KiB|MiB|GiB|TiB|PiB)$")
+    for k in rules._rules.keys():
+        res_ = rules._rules[k].rule.resources
+        if runtime:
+            if "walltime" in res_.keys():
+                runtime_ = walltime_sge_to_generic(res_["walltime"])
+                del rules._rules[k].rule.resources["walltime"]
+            elif "time_min" in res_.keys():
+                runtime_ = walltime_sge_to_generic(res_["time_min"])
+                del rules._rules[k].rule.resources["time_min"]
+            elif "runtime" in res_.keys():
+                runtime_ = walltime_sge_to_generic(res_["runtime"])
+            else:
+                runtime_ = False
+            if runtime_:
+                rules._rules[k].rule.resources["runtime"] = runtime_
+        if memory == "perthread_to_perjob":
+            if "mem_mb" in res_.keys():
+                mem_ = float(res_["mem_mb"]) * res_["_cores"]
+                if mem_ % 1 == 0:
+                    rules._rules[k].rule.resources["mem_mb"] = int(mem_)
+                else:
+                    rules._rules[k].rule.resources["mem_mb"] = mem_
+            elif "mem" in res_.keys():
+                mem_ = re_mem.match(res_["mem"])
+                if mem_:
+                    mem = float(mem_[1]) * res_["_cores"]
+                else:
+                    raise ValueError(
+                        f"Invalid memory format: {res_['mem']} in rule {k}"
+                    )
+                if mem % 1 == 0:
+                    mem = int(mem)
+                rules._rules[k].rule.resources["mem"] = f"{mem}{mem_[2]}"
+        elif memory == "rename_mem_mb_per_cpu":
+            if "mem_mb" in res_.keys():
+                rules._rules[k].rule.resources["mem_mb_per_cpu"] = res_["mem_mb"]
+                del rules._rules[k].rule.resources["mem_mb"]
+            elif "mem" in res_.keys():
+                raise ValueError(
+                    f"Cannot rename resource from 'mem' to 'mem_mb_per_cpu' in rule {k}"
+                )

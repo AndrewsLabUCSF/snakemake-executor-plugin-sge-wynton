@@ -1,0 +1,36 @@
+#SGE submission command: 
+qsub 
+-o /wynton/group/andrews/users/rakshyasharma/sge-wynton/test_07.22.24/.snakemake/sge_logs/rule_quantify_genes/sample=Sample2/ed0fd2b4-dc0a-46c2-b38a-8513258449cf.log 
+-e /wynton/group/andrews/users/rakshyasharma/sge-wynton/test_07.22.24/.snakemake/sge_logs/rule_quantify_genes/sample=Sample2/ed0fd2b4-dc0a-46c2-b38a-8513258449cf.log 'Snakemake_rule_quantify_genes:sample=Sample2___(ed0fd2b4-dc0a-46c2-b38a-8513258449cf)' 
+-l h_rt=00:09:00 
+-l mem_free=2G 
+-pe smp 2 
+-q default.q 
+-cwd /wynton/group/andrews/users/rakshyasharma/sge-wynton/test_07.22.24 '/wynton/group/andrews/users/rakshyasharma/miniforge/envs/snakemake/bin/python 
+-m snakemake --snakefile /wynton/group/andrews/users/rakshyasharma/sge-wynton/test_07.22.24/workflow/Snakefile 
+--target-jobs 'quantify_genes:sample=Sample2' 
+--allowed-rules 'quantify_genes' 
+--cores 72 
+--attempt 1 
+--force-use-threads  
+--resources 'mem_mb=2048' 'mem_mib=1954' 
+--wait-for-files '/wynton/group/andrews/users/rakshyasharma/sge-wynton/test_07.22.24/.snakemake/tmp.u9bokqc7' 'resources/genome.fa' 'resources/Sample2.R1.fastq.gz' 'resources/Sample2.R2.fastq.gz' 
+--force --target-files-omit-workdir-adjustment 
+--keep-storage-local-copies 
+--max-inventory-time 0 
+--nocolor 
+--notemp 
+--no-hooks 
+--nolock 
+--ignore-incomplete 
+--rerun-triggers software-env code params mtime input 
+--deployment-method conda 
+--conda-frontend mamba 
+--conda-base-path /wynton/group/andrews/users/rakshyasharma/miniforge/envs/snakemake 
+--shared-fs-usage source-cache input-output sources storage-local-copies software-deployment persistence 
+--wrapper-prefix https://github.com/snakemake/snakemake-wrappers/raw/ 
+--latency-wait 5 --scheduler ilp 
+--local-storage-prefix .snakemake/storage 
+--scheduler-solver-path /wynton/group/andrews/users/rakshyasharma/miniforge/envs/snakemake/bin
+--default-resources base64//dG1wZGlyPXN5c3RlbV90bXBkaXI= 
+--mode remote'
