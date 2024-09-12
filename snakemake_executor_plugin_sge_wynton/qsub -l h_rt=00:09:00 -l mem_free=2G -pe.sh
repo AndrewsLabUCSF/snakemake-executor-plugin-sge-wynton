@@ -1,0 +1,1 @@
+qsub -l h_rt=00:09:00 -l mem_free=2G -pe smp 2 -cwd -b y 'echo foo > bar.txt'

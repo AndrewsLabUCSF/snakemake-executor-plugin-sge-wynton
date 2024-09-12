@@ -53,7 +53,7 @@ common_settings = CommonSettings(
     pass_default_resources_args=True,
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
-    # wait a bit until bjobs has job info available
+    # wait a bit until sge_jobs has job info available
     init_seconds_before_status_checks=20,
     pass_group_args=True,
 )
@@ -66,8 +66,19 @@ class Executor(RemoteExecutor):
         self.run_uuid = str(uuid.uuid4())
         self._fallback_project_arg = None
         self._fallback_queue = None
-        self.sge_config = {}
-
+        self.sge_jobid = None
+        # Initialize sge_config
+        sge_root = os.getenv('SGE_ROOT')
+        sge_cell = os.getenv('SGE_CELL')
+        print(f"SGE_ROOT: {sge_root}, SGE_CELL: {sge_cell}")
+        if sge_root and sge_cell:
+            self.sge_config = {
+                'accounting': f"{sge_root}/{sge_cell}/common/accounting"
+            }
+            print(f"Accounting file path: {self.sge_config['accounting']}")
+        else:
+            raise WorkflowError("SGE_ROOT and SGE_CELL environment variables must be set.")
+        #self.sge_config = {}
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -210,7 +221,7 @@ class Executor(RemoteExecutor):
         #
         # async with self.status_rate_limiter:
         #    # query remote middleware here
-        fail_stati = ("SSUSP", "EXIT", "USUSP")
+        fail_stati = ("SSUSP", "EXIT", "USUSP", "Eqw")
         # Cap sleeping time between querying the status of all active jobs:
         max_sleep_time = 180
 
@@ -225,7 +236,7 @@ class Executor(RemoteExecutor):
 
         for i in range(status_attempts):
             async with self.status_rate_limiter:
-                (status_of_jobs, job_query_duration) = await self.job_stati_bjobs()
+                (status_of_jobs, job_query_duration) = await self.job_stati_sge_jobs()
                 job_query_durations.append(job_query_duration)
                 self.logger.debug(f"status_of_jobs after qsub is: {status_of_jobs}")
                 # only take jobs that are still active
@@ -236,7 +247,7 @@ class Executor(RemoteExecutor):
                     active_jobs_seen | active_jobs_ids_with_current_status
                 )
                 missing_status_ever = active_jobs_ids - active_jobs_seen
-                if missing_status_ever and i > 2:
+                if missing_status_ever and i >= 2:
                     (
                         status_of_jobs_sgeevt,
                         job_query_duration,
@@ -263,7 +274,7 @@ class Executor(RemoteExecutor):
                     f"Unable to get the status of all active_jobs that should be "
                     f"in sge, even after {status_attempts} attempts.\n"
                     f"The jobs with the following job ids were previously seen "
-                    "but are no longer reported by bjobs or in sge_EVENTS:\n"
+                    "but are no longer reported by sge_jobs or in sge_EVENTS:\n"
                     f"{missing_status}\n"
                     f"Please double-check with your sge cluster administrator, that "
                     "job accounting is properly set up.\n"
@@ -272,27 +283,24 @@ class Executor(RemoteExecutor):
         any_finished = False
         for j in active_jobs:
             if j.external_jobid not in status_of_jobs:
-                yield j
+                yield j  # Retry in the next iteration
                 continue
+
             status = status_of_jobs[j.external_jobid]
             if status == "DONE":
                 self.report_job_success(j)
                 any_finished = True
                 active_jobs_seen.remove(j.external_jobid)
-            elif status == "UNKWN":
-                # the job probably does not exist anymore, but 'sacct' did not work
-                # so we assume it is finished
-                self.report_job_success(j)
-                any_finished = True
-                active_jobs_seen.remove(j.external_jobid)
+            #elif status == "UNKWN":
+                # The job probably does not exist anymore, so assume it is finished
+                #self.report_job_success(j)
+                #any_finished = True
+                #active_jobs_seen.remove(j.external_jobid)
             elif status in fail_stati:
-                msg = (
-                    f"sge-job '{j.external_jobid}' failed, sge status is: "
-                    f"'{status}'"
-                )
+                msg = f"SGE job '{j.external_jobid}' failed, SGE status is: '{status}'"
                 self.report_job_error(j, msg=msg, aux_logs=[j.aux["sge_logfile"]])
                 active_jobs_seen.remove(j.external_jobid)
-            else:  # still running?
+            else:  # still running
                 yield j
 
         if not any_finished:
@@ -323,16 +331,21 @@ class Executor(RemoteExecutor):
             except subprocess.TimeoutExpired:
                 self.logger.warning("Unable to cancel jobs within a minute.")
 
-    async def job_stati_bjobs(self):
+    async def job_stati_sge_jobs(self):
         """
-        Obtain sge job status of all submitted jobs from bjobs
+        Obtain sge job status of all submitted jobs from sge_jobs
         """
-        uuid = self.run_uuid
 
-        statuses_all = []
+        uuid = self.run_uuid
+        #jobid = self.sge_jobid
+        #statuses_all = []
+        query_duration = None
 
         try:
-            running_cmd = f"qstat -u '*' -s r -j"
+            running_cmd = f"qstat -s pr -u '{os.getenv('USER')}' -xml"
+            print(f"Running command: {running_cmd}")
+            #running_cmd = f"qstat -j {self.sge_jobid}"
+            #running_cmd = f"qstat -u '*'"
             time_before_query = time.time()
             running = subprocess.check_output(
                 running_cmd, shell=True, text=True, stderr=subprocess.PIPE
@@ -345,7 +358,13 @@ class Executor(RemoteExecutor):
                 f"The output is:\n'{running}'\n"
             )
             if running:
-                statuses_all += [tuple(x.split()) for x in running.strip().split("\n")]
+                #qstat_xml = xmltodict.parse(running)
+                qstat_xml = xmltodict.parse(running)['job_info']['job_info']['job_list']
+                qstat_jobs = {x['JB_job_number']: {"name": x["JB_name"], "state": x["@state"]}
+              for x in qstat_xml}
+                res = {k: v["state"] for k, v in qstat_jobs.items()
+                       if re.search(uuid, v["name"])}
+                #statuses_all += [tuple(x.split()) for x in running.strip().split("\n")]
         except subprocess.CalledProcessError as e:
             self.logger.error(
                 f"The running job status query failed with command: {running_cmd}\n"
@@ -353,7 +372,12 @@ class Executor(RemoteExecutor):
             )
             pass
 
-        res = {x[0]: x[1] for x in statuses_all}
+#steps:
+# process the xml to contain job_ids, job names, and statuses
+#filter all the job names include uuid
+#put it in the format where the key is job ids and value is the status
+#return the dictionary
+
 
         return (res, query_duration)
 
@@ -361,8 +385,12 @@ class Executor(RemoteExecutor):
         """
         Obtain sge job status of all submitted jobs from sge_EVENTS
         """
-        uuid = self.run_uuid
 
+        statuses = {
+        "0": "DONE",  # Job has terminated with status 0.
+        "1": "EXIT",  # Job terminated with a non-zero status.
+    }
+        """
         statuses = {
             "0": "NULL",  # State null
             "1": "PEND",  # Job is pending (it has not been dispatched yet).
@@ -379,7 +407,8 @@ class Executor(RemoteExecutor):
             "65536": "UNKWN",  # Stat unknown (local cluster contact lost). ***
             "131072": "PROV",  # Job is provisional. ****
         }
-
+        
+"""
         #   * because execution host was overloaded or queue run window closed.
         #   ** may have been aborted due to an execution error
         #      or killed by owner or sge sysadmin.
@@ -389,20 +418,20 @@ class Executor(RemoteExecutor):
         # **** This state shows that the job is dispatched to a standby
         #      power-saved host, and this host is being waken up or started up.
 
+
+        username = os.getenv("USER")
+
         awk_code = f"""
-        awk '
-            BEGIN {{
-                FPAT = "([^ ]+)|(\\"[^\\"]+\\")"
-            }}
-            $1 == "\\"JOB_NEW\\"" && $5 == {os.geteuid()} && $42 ~ "{uuid}" {{
-                a[$4]
-                next
-            }}
-            $4 in a && $1 == "\\"JOB_STATUS\\"" && $5 != 192 {{
-                print $4, $5
-            }}
-        ' {self.sge_config['sge_EVENTS']}
+        tail -n 500000 {self.sge_config['accounting']} | 
+        awk 'BEGIN {{
+            FS = ":"; OFS = "\\t"
+        }} 
+        $4 == "{username}" && $5 ~ /{self.run_uuid}/ {{
+            print $6, $13
+            }}'
         """
+
+        print(f"Executing AWK command: {awk_code}")
 
         statuses_all = []
 
@@ -418,8 +447,8 @@ class Executor(RemoteExecutor):
                 f"The output is:\n'{finished}'\n"
             )
             if finished:
-                codes = [tuple(x.split()) for x in finished.strip().split("\n")]
-                statuses_all += [(x, statuses[y]) for x, y in codes]
+                codes = [tuple(x.split()) for x in finished.strip().split("\n") if len(x.split()) >= 2]
+                statuses_all += [(x, statuses[y]) for x, y in codes if len(x) >= 2 and len(y) >= 2]
         except subprocess.CalledProcessError as e:
             self.logger.error(
                 f"The finished job status query failed with command: {awk_code}\n"
@@ -427,8 +456,8 @@ class Executor(RemoteExecutor):
             )
             pass
 
-        res = {x[0]: x[1] for x in statuses_all}
-
+        res = {x[0]: x[1] for x in statuses_all if len(x) > 1}
+        print(f"res: {res}")
         return (res, query_duration)
 
     def get_cpus(self, job: JobExecutorInterface):
@@ -558,7 +587,7 @@ class Executor(RemoteExecutor):
         )
     
         return ""
-
+    
 
 
 def walltime_sge_to_generic(w):
