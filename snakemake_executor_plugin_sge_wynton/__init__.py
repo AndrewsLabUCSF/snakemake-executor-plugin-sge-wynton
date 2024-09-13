@@ -1,6 +1,7 @@
-__author__ = "Brian Fulton-Howard, David Lähnemann, Johannes Köster, Christian Meesters"
+__author__ = "Rakshya Ujhanthachhen Sharma, Brian Fulton-Howard, David Lähnemann, Johannes Köster, Christian Meesters"
 __copyright__ = (
-    "Copyright 2023, Brian Fulton-Howard, ",
+    "Copyright 2024, Rakshya Ujhanthachhen Sharma, ",
+    " Brian Fulton-Howard, ",
     "David Lähnemann, ",
     "Johannes Köster, ",
     "Christian Meesters",
@@ -54,14 +55,11 @@ common_settings = CommonSettings(
     pass_default_resources_args=True,
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
-    # wait a bit until sge_jobs has job info available
+    # wait a bit until qstat has job info available
     init_seconds_before_status_checks=20,
     pass_group_args=True,
 )
 
-
-# Required:
-# Implementation of your executor
 class Executor(RemoteExecutor):
     def __post_init__(self):
         self.run_uuid = str(uuid.uuid4())
@@ -71,15 +69,12 @@ class Executor(RemoteExecutor):
         # Initialize sge_config
         sge_root = os.getenv('SGE_ROOT')
         sge_cell = os.getenv('SGE_CELL')
-        #print(f"SGE_ROOT: {sge_root}, SGE_CELL: {sge_cell}")
         if sge_root and sge_cell:
             self.sge_config = {
                 'accounting': f"{sge_root}/{sge_cell}/common/accounting"
             }
-            #print(f"Accounting file path: {self.sge_config['accounting']}")
         else:
             raise WorkflowError("SGE_ROOT and SGE_CELL environment variables must be set.")
-        #self.sge_config = {}
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
@@ -149,9 +144,7 @@ class Executor(RemoteExecutor):
 
         # Append time to the call in the format 'HH:MM:SS'
         call += f" -l h_rt={time_sge}"
-        
-        # Additional job submission logic...
-        #print(f"Submitting job with h_rt: {time_sge} seconds")
+    
 
         # Call the get_mem method to get the memory value
         mem_free = self.get_mem(job)
@@ -175,7 +168,6 @@ class Executor(RemoteExecutor):
         # and finally the job to execute with all the snakemake parameters
         # TODO do I need an equivalent to --wrap?
         #call += f' "{exec_job}"'
-        #print(f"SGE submission command: {call}")
 
         self.logger.debug(f"qsub call: {call}")
         try:
@@ -237,7 +229,7 @@ class Executor(RemoteExecutor):
 
         for i in range(status_attempts):
             async with self.status_rate_limiter:
-                (status_of_jobs, job_query_duration) = await self.job_stati_sge_jobs()
+                (status_of_jobs, job_query_duration) = await self.job_stati_qstat()
                 job_query_durations.append(job_query_duration)
                 self.logger.debug(f"status_of_jobs after qsub is: {status_of_jobs}")
                 # only take jobs that are still active
@@ -252,11 +244,11 @@ class Executor(RemoteExecutor):
                     (
                         status_of_jobs_sgeevt,
                         job_query_duration,
-                    ) = await self.job_stati_sgeevents()
+                    ) = await self.job_stati_qacct()
                     job_query_durations.append(job_query_duration)
                     status_of_jobs.update(status_of_jobs_sgeevt)
                     self.logger.debug(
-                        f"status_of_jobs after sge_EVENTS is: {status_of_jobs}"
+                        f"status_of_jobs after qacct is: {status_of_jobs}"
                     )
                     active_jobs_ids_with_current_status = (
                         set(status_of_jobs.keys()) & active_jobs_ids
@@ -275,7 +267,7 @@ class Executor(RemoteExecutor):
                     f"Unable to get the status of all active_jobs that should be "
                     f"in sge, even after {status_attempts} attempts.\n"
                     f"The jobs with the following job ids were previously seen "
-                    "but are no longer reported by sge_jobs or in sge_EVENTS:\n"
+                    "but are no longer reported by qstat or in sge_EVENTS:\n"
                     f"{missing_status}\n"
                     f"Please double-check with your sge cluster administrator, that "
                     "job accounting is properly set up.\n"
@@ -298,7 +290,7 @@ class Executor(RemoteExecutor):
                 msg = f"SGE job '{j.external_jobid}' failed, SGE status is: '{status}'"
                 self.report_job_error(j, msg=msg, aux_logs=[j.aux["sge_logfile"]])
                 active_jobs_seen.remove(j.external_jobid)
-            else:  # still running
+            else:
                 yield j
 
         if not any_finished:
@@ -317,7 +309,7 @@ class Executor(RemoteExecutor):
             try:
                 # timeout set to 60, because a scheduler cycle usually is
                 # about 30 sec, but can be longer in extreme cases.
-                # Under 'normal' circumstances, 'bkill' is executed in
+                # Under 'normal' circumstances, 'qdel' is executed in
                 # virtually no time.
                 subprocess.check_output(
                     f"qdel {jobids}",
@@ -326,25 +318,24 @@ class Executor(RemoteExecutor):
                     timeout=60,
                     stderr=subprocess.PIPE,
                 )
+                self.logger.info(f"Cancelled jobs {jobids}")
             except subprocess.TimeoutExpired:
-                self.logger.warning("Unable to cancel jobs within a minute.")
+                self.logger.warning("Unable to cancel jobs within a minute. Jobs:m {jobids}")
 
-    async def job_stati_sge_jobs(self):
+            except subprocess.CalledProcessError as e:
+                self.logger.warning(f"Failed to cancel jobs {jobids}. Error: {e.stderr.strip()}")
+
+    async def job_stati_qstat(self):
         """
-        Obtain sge job status of all submitted jobs from sge_jobs
+        Obtain sge job status of all submitted jobs from qstat
         """
 
         uuid = self.run_uuid
-        #jobid = self.sge_jobid
-        #statuses_all = []
         query_duration = None
         res ={}
 
         try:
             running_cmd = f"qstat -s pr -u '{os.getenv('USER')}' -xml"
-            #print(f"Running command: {running_cmd}")
-            #running_cmd = f"qstat -j {self.sge_jobid}"
-            #running_cmd = f"qstat -u '*'"
             time_before_query = time.time()
             running = subprocess.check_output(
                 running_cmd, shell=True, text=True, stderr=subprocess.PIPE
@@ -369,40 +360,21 @@ class Executor(RemoteExecutor):
 
                 # Filter jobs based on UUID in the job name
                 res = {k: v["state"] for k, v in qstat_jobs.items() if re.search(uuid, v["name"])}
-
-                #print(f"res: {res}")   
-
-                #qstat_xml = xmltodict.parse(running)
-                #qstat_xml = xmltodict.parse(running)['job_info']['job_info']['job_list']
-                #qstat_jobs = {x['JB_job_number']: {"name": x["JB_name"], "state": x["@state"]}
-              #for x in qstat_xml}
-                #res = {k: v["state"] for k, v in qstat_jobs.items()
-                       #if re.search(uuid, v["name"])}
-                #statuses_all += [tuple(x.split()) for x in running.strip().split("\n")]
         except subprocess.CalledProcessError as e:
             self.logger.error(
                 f"The running job status query failed with command: {running_cmd}\n"
                 f"Error message: {e.stderr.strip()}\n"
             )
             pass
-
-#steps:
-# process the xml to contain job_ids, job names, and statuses
-#filter all the job names include uuid
-#put it in the format where the key is job ids and value is the status
-#return the dictionary
-
-
         return (res, query_duration)
 
-    async def job_stati_sgeevents(self):
+    async def job_stati_qacct(self):
         """
         Obtain sge job status of all submitted jobs from sge_EVENTS
         """
 
         statuses = {
         "0": "DONE",  # Job has terminated with status 0.
-        #"1": "EXIT",  # Job terminated with a non-zero status.
     }
         def get_status(exit_code):
             return statuses.get(exit_code, "EXIT") 
@@ -429,9 +401,7 @@ class Executor(RemoteExecutor):
             }}'
         """
 
-        #print(f"Executing AWK command: {awk_code}")
         finished = subprocess.check_output(awk_code, shell=True, text=True, stderr=subprocess.PIPE)
-       # print(f"AWK command output: {finished}")
         statuses_all = []
         query_duration = None
         try:
@@ -445,18 +415,8 @@ class Executor(RemoteExecutor):
                 f"It took: {query_duration} seconds\n"
                 f"The output is:\n'{"finished",finished}'\n"
             )
-            # Check if the AWK command returned any output
             if finished:
-                # Split the output into lines and parse each line
-                lines = finished.split("\n")
-                for line in lines:
-                    parts = line.split()  # Split each line into parts
-                    if len(parts) >= 2:  # Ensure there are at least two fields (job ID, exit code)
-                        job_id, exit_code = parts[0], parts[1]
-                        status = get_status(exit_code)  # Get status based on exit code
-                        statuses_all.append((job_id, status))  # Append tuple of (job ID, status)
-
-            #print(f"statuses_all: {statuses_all}")
+                statuses_all = [(p[0], get_status(p[1])) for p in (line.split() for line in finished.split("\n")) if len(p) >= 2]
 
         except subprocess.CalledProcessError as e:
             self.logger.error(
@@ -466,7 +426,6 @@ class Executor(RemoteExecutor):
             pass
 
         res = {x[0]: x[1] for x in statuses_all if len(x) > 1}
-        #print(f"res: {res}")
         return (res, query_duration)
 
     def get_cpus(self, job: JobExecutorInterface):
@@ -481,8 +440,6 @@ class Executor(RemoteExecutor):
                     f"cpus_per_task must be an integer, but is {cpus_per_task}"
                 )
             cpus_total = cpus_per_task
-        # ensure that at least 1 cpu is requested
-        # because 0 is not allowed by sge
         return max(1, cpus_total)
 
     def get_mem(self, job: JobExecutorInterface):
@@ -508,9 +465,7 @@ class Executor(RemoteExecutor):
                 "No valid job memory information is given - submitting without memory request. "
                 "This might or might not work on your cluster."
             )
-            return None  # Return None if there's no valid memory info
-        
-        # Return the memory as an integer (rounded down)
+            return None  
         return int(mem_gb)
 
 
@@ -526,21 +481,7 @@ class Executor(RemoteExecutor):
             return f" -P {job.resources.sge_project}"
         else:
             return ""
-        """
-        else:
-            if self._fallback_project_arg is None:
-                self.logger.warning("No sge project given, trying to guess.")
-                project = self.get_project()
-                if project:
-                    self.logger.warning(f"Guessed sge project: {project}")
-                    self._fallback_project_arg = f" -P {project}"
-                else:
-                    self.logger.warning(
-                        "Unable to guess sge project. Trying to proceed without."
-                    )
-                    self._fallback_project_arg = ""  # no project specific args for bsub
-            return self._fallback_project_arg
-        """
+
     def get_queue_arg(self, job: JobExecutorInterface):
         """
         checks whether the desired queue is valid,
@@ -549,7 +490,6 @@ class Executor(RemoteExecutor):
         """
         if job.resources.get("sge_queue"):
             queue = job.resources.sge_queue
-            #print("Here is the queue: ", queue)
         else:
             if self._fallback_queue is None:
                 self._fallback_queue = self.get_default_queue(job)
@@ -597,7 +537,19 @@ class Executor(RemoteExecutor):
     
         return ""
     
-
+def format_job_exec(self, job: JobExecutorInterface):
+    """
+    Formats the job execution command.
+    """
+    exec_job = ""
+    # Get the execution command for group jobs
+    if job.is_group():
+        # Ensure that all jobs in the group have an exec_job attribute
+        exec_job = " && ".join([j.exec_job for j in job.jobs if hasattr(j, 'exec_job')])
+    else:
+        pass
+    
+    return exec_job
 
 def walltime_sge_to_generic(w):
     """
