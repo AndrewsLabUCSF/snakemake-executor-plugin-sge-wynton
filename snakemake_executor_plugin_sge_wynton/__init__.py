@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import time
+import xmltodict
 from dataclasses import dataclass, field
 from typing import List, AsyncGenerator, Optional
 from collections import Counter
@@ -70,12 +71,12 @@ class Executor(RemoteExecutor):
         # Initialize sge_config
         sge_root = os.getenv('SGE_ROOT')
         sge_cell = os.getenv('SGE_CELL')
-        print(f"SGE_ROOT: {sge_root}, SGE_CELL: {sge_cell}")
+        #print(f"SGE_ROOT: {sge_root}, SGE_CELL: {sge_cell}")
         if sge_root and sge_cell:
             self.sge_config = {
                 'accounting': f"{sge_root}/{sge_cell}/common/accounting"
             }
-            print(f"Accounting file path: {self.sge_config['accounting']}")
+            #print(f"Accounting file path: {self.sge_config['accounting']}")
         else:
             raise WorkflowError("SGE_ROOT and SGE_CELL environment variables must be set.")
         #self.sge_config = {}
@@ -150,7 +151,7 @@ class Executor(RemoteExecutor):
         call += f" -l h_rt={time_sge}"
         
         # Additional job submission logic...
-        print(f"Submitting job with h_rt: {time_sge} seconds")
+        #print(f"Submitting job with h_rt: {time_sge} seconds")
 
         # Call the get_mem method to get the memory value
         mem_free = self.get_mem(job)
@@ -221,7 +222,7 @@ class Executor(RemoteExecutor):
         #
         # async with self.status_rate_limiter:
         #    # query remote middleware here
-        fail_stati = ("SSUSP", "EXIT", "USUSP", "Eqw")
+        fail_stati = ("EXIT","Eqw")
         # Cap sleeping time between querying the status of all active jobs:
         max_sleep_time = 180
 
@@ -247,7 +248,7 @@ class Executor(RemoteExecutor):
                     active_jobs_seen | active_jobs_ids_with_current_status
                 )
                 missing_status_ever = active_jobs_ids - active_jobs_seen
-                if missing_status_ever and i >= 2:
+                if missing_status_ever and i > 2:
                     (
                         status_of_jobs_sgeevt,
                         job_query_duration,
@@ -269,7 +270,7 @@ class Executor(RemoteExecutor):
                 self.logger.debug(f"active_jobs_seen are: {active_jobs_seen}")
                 if not missing_status and not missing_status_ever:
                     break
-            if i >= status_attempts - 1:
+            if i >= status_attempts - 1 and missing_status_ever:
                 self.logger.warning(
                     f"Unable to get the status of all active_jobs that should be "
                     f"in sge, even after {status_attempts} attempts.\n"
@@ -283,19 +284,16 @@ class Executor(RemoteExecutor):
         any_finished = False
         for j in active_jobs:
             if j.external_jobid not in status_of_jobs:
-                yield j  # Retry in the next iteration
+                if i < 2:
+                    yield j  # Retry in the next iteration
                 continue
 
             status = status_of_jobs[j.external_jobid]
+            active_jobs_seen.add(j.external_jobid)
             if status == "DONE":
                 self.report_job_success(j)
                 any_finished = True
                 active_jobs_seen.remove(j.external_jobid)
-            #elif status == "UNKWN":
-                # The job probably does not exist anymore, so assume it is finished
-                #self.report_job_success(j)
-                #any_finished = True
-                #active_jobs_seen.remove(j.external_jobid)
             elif status in fail_stati:
                 msg = f"SGE job '{j.external_jobid}' failed, SGE status is: '{status}'"
                 self.report_job_error(j, msg=msg, aux_logs=[j.aux["sge_logfile"]])
@@ -340,10 +338,11 @@ class Executor(RemoteExecutor):
         #jobid = self.sge_jobid
         #statuses_all = []
         query_duration = None
+        res ={}
 
         try:
             running_cmd = f"qstat -s pr -u '{os.getenv('USER')}' -xml"
-            print(f"Running command: {running_cmd}")
+            #print(f"Running command: {running_cmd}")
             #running_cmd = f"qstat -j {self.sge_jobid}"
             #running_cmd = f"qstat -u '*'"
             time_before_query = time.time()
@@ -358,12 +357,27 @@ class Executor(RemoteExecutor):
                 f"The output is:\n'{running}'\n"
             )
             if running:
-                #qstat_xml = xmltodict.parse(running)
-                qstat_xml = xmltodict.parse(running)['job_info']['job_info']['job_list']
+                qstat_dict = xmltodict.parse(running)
+                job_list = qstat_dict.get("job_info", {}).get("job_info", {}).get("job_list", [])
+
+                # If there's only one job, ensure job_list is treated as a list
+                if isinstance(job_list, dict):
+                    job_list = [job_list]
+
                 qstat_jobs = {x['JB_job_number']: {"name": x["JB_name"], "state": x["@state"]}
-              for x in qstat_xml}
-                res = {k: v["state"] for k, v in qstat_jobs.items()
-                       if re.search(uuid, v["name"])}
+                            for x in job_list}
+
+                # Filter jobs based on UUID in the job name
+                res = {k: v["state"] for k, v in qstat_jobs.items() if re.search(uuid, v["name"])}
+
+                #print(f"res: {res}")   
+
+                #qstat_xml = xmltodict.parse(running)
+                #qstat_xml = xmltodict.parse(running)['job_info']['job_info']['job_list']
+                #qstat_jobs = {x['JB_job_number']: {"name": x["JB_name"], "state": x["@state"]}
+              #for x in qstat_xml}
+                #res = {k: v["state"] for k, v in qstat_jobs.items()
+                       #if re.search(uuid, v["name"])}
                 #statuses_all += [tuple(x.split()) for x in running.strip().split("\n")]
         except subprocess.CalledProcessError as e:
             self.logger.error(
@@ -388,27 +402,11 @@ class Executor(RemoteExecutor):
 
         statuses = {
         "0": "DONE",  # Job has terminated with status 0.
-        "1": "EXIT",  # Job terminated with a non-zero status.
+        #"1": "EXIT",  # Job terminated with a non-zero status.
     }
-        """
-        statuses = {
-            "0": "NULL",  # State null
-            "1": "PEND",  # Job is pending (it has not been dispatched yet).
-            "2": "PSUSP",  # Pending job suspended by owner or sge sysadmin.
-            "4": "RUN",  # Job is running.
-            "8": "SSUSP",  # Running suspended by the system. *
-            "16": "USUSP",  # Running job suspended by owner or sge sysadmin.
-            "32": "EXIT",  # Job terminated with a non-zero status. **
-            "64": "DONE",  # Job has terminated with status 0.
-            "128": "PDONE",  # Post job process done successfully.
-            "256": "PERR",  # Post job process has an error.
-            "512": "WAIT",  # Chunk job waiting its turn to exec.
-            "32768": "RUNKWN",  # Stat unknown (remote cluster contact lost).
-            "65536": "UNKWN",  # Stat unknown (local cluster contact lost). ***
-            "131072": "PROV",  # Job is provisional. ****
-        }
-        
-"""
+        def get_status(exit_code):
+            return statuses.get(exit_code, "EXIT") 
+
         #   * because execution host was overloaded or queue run window closed.
         #   ** may have been aborted due to an execution error
         #      or killed by owner or sge sysadmin.
@@ -431,24 +429,35 @@ class Executor(RemoteExecutor):
             }}'
         """
 
-        print(f"Executing AWK command: {awk_code}")
-
+        #print(f"Executing AWK command: {awk_code}")
+        finished = subprocess.check_output(awk_code, shell=True, text=True, stderr=subprocess.PIPE)
+       # print(f"AWK command output: {finished}")
         statuses_all = []
-
+        query_duration = None
         try:
             time_before_query = time.time()
             finished = subprocess.check_output(
                 awk_code, shell=True, text=True, stderr=subprocess.PIPE
-            )
+            ).strip()
             query_duration = time.time() - time_before_query
             self.logger.debug(
                 f"The job status for completed jobs was queried.\n"
                 f"It took: {query_duration} seconds\n"
-                f"The output is:\n'{finished}'\n"
+                f"The output is:\n'{"finished",finished}'\n"
             )
+            # Check if the AWK command returned any output
             if finished:
-                codes = [tuple(x.split()) for x in finished.strip().split("\n") if len(x.split()) >= 2]
-                statuses_all += [(x, statuses[y]) for x, y in codes if len(x) >= 2 and len(y) >= 2]
+                # Split the output into lines and parse each line
+                lines = finished.split("\n")
+                for line in lines:
+                    parts = line.split()  # Split each line into parts
+                    if len(parts) >= 2:  # Ensure there are at least two fields (job ID, exit code)
+                        job_id, exit_code = parts[0], parts[1]
+                        status = get_status(exit_code)  # Get status based on exit code
+                        statuses_all.append((job_id, status))  # Append tuple of (job ID, status)
+
+            #print(f"statuses_all: {statuses_all}")
+
         except subprocess.CalledProcessError as e:
             self.logger.error(
                 f"The finished job status query failed with command: {awk_code}\n"
@@ -457,7 +466,7 @@ class Executor(RemoteExecutor):
             pass
 
         res = {x[0]: x[1] for x in statuses_all if len(x) > 1}
-        print(f"res: {res}")
+        #print(f"res: {res}")
         return (res, query_duration)
 
     def get_cpus(self, job: JobExecutorInterface):
@@ -540,7 +549,7 @@ class Executor(RemoteExecutor):
         """
         if job.resources.get("sge_queue"):
             queue = job.resources.sge_queue
-            print("Here is the queue: ", queue)
+            #print("Here is the queue: ", queue)
         else:
             if self._fallback_queue is None:
                 self._fallback_queue = self.get_default_queue(job)
