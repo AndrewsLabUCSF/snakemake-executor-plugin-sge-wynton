@@ -388,7 +388,6 @@ class Executor(RemoteExecutor):
         # **** This state shows that the job is dispatched to a standby
         #      power-saved host, and this host is being waken up or started up.
 
-
         username = os.getenv("USER")
 
         awk_code = f"""
