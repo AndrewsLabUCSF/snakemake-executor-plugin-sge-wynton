@@ -272,6 +272,9 @@ class Executor(RemoteExecutor):
                     f"Please double-check with your sge cluster administrator, that "
                     "job accounting is properly set up.\n"
                 )
+                for j in active_jobs:
+                    if j.external_jobid in missing_status_ever:
+                        self.cancel_jobs([j])
 
         any_finished = False
         for j in active_jobs:
