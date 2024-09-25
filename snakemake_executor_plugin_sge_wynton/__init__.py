@@ -125,9 +125,8 @@ class Executor(RemoteExecutor):
         # we use a run_uuid in the job-name, to allow `--name`-based
         # filtering in the job status checks
 
-        call = f"qsub -o {sge_logfile} -e {sge_logfile} -N '{jobname}'"
-
-
+        call = f"qsub -shell y -o {sge_logfile} -e {sge_logfile} -N '{jobname}'"
+        
         # Extracting time_min and converting if necessary
         time_min = job.resources.get('time_min')
 
@@ -170,6 +169,7 @@ class Executor(RemoteExecutor):
         #call += f' "{exec_job}"'
 
         self.logger.debug(f"qsub call: {call}")
+        #print(f"qsub call: {call}")
         try:
             out = subprocess.check_output(
                 call, shell=True, text=True, stderr=subprocess.STDOUT
@@ -214,7 +214,7 @@ class Executor(RemoteExecutor):
         #
         # async with self.status_rate_limiter:
         #    # query remote middleware here
-        fail_stati = ("EXIT","Eqw")
+        fail_stati = ("EXIT")
         # Cap sleeping time between querying the status of all active jobs:
         max_sleep_time = 180
 
@@ -339,6 +339,7 @@ class Executor(RemoteExecutor):
 
         try:
             running_cmd = f"qstat -s pr -u '{os.getenv('USER')}' -xml"
+            #print(f"Running command: {running_cmd}")
             time_before_query = time.time()
             running = subprocess.check_output(
                 running_cmd, shell=True, text=True, stderr=subprocess.PIPE
@@ -352,11 +353,33 @@ class Executor(RemoteExecutor):
             )
             if running:
                 qstat_dict = xmltodict.parse(running)
-                job_list = qstat_dict.get("job_info", {}).get("job_info", {}).get("job_list", [])
+                queue_info = qstat_dict.get("queue_info", {})
+                running_jobs = queue_info.get("job_list", [])
 
+                # Ensure running_jobs is always treated as a list
+                if isinstance(running_jobs, dict):
+                    running_jobs = [running_jobs]
+
+                # Handle the pending jobs from job_info
+                job_info = qstat_dict.get("job_info", {}).get("job_info", {})
+                
+                if not job_info:
+                    self.logger.warning("job_info is empty in qstat response.")
+                    pending_jobs = []
+                else:
+                    pending_jobs = job_info.get("job_list", [])
+
+                    # Ensure pending_jobs is always treated as a list
+                    if isinstance(pending_jobs, dict):
+                        pending_jobs = [pending_jobs]
+
+                # Now concatenate running and pending jobs
+                job_list = running_jobs + pending_jobs
+                    #job_list = qstat_dict.get("job_info", {}).get("job_info", {}).get("job_list", [])
+                time.sleep(30)
                 # If there's only one job, ensure job_list is treated as a list
-                if isinstance(job_list, dict):
-                    job_list = [job_list]
+                #if isinstance(job_list, dict):
+                 #   job_list = [job_list]
 
                 qstat_jobs = {x['JB_job_number']: {"name": x["JB_name"], "state": x["@state"]}
                             for x in job_list}
