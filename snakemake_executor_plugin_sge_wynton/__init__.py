@@ -19,6 +19,7 @@ from typing import List, AsyncGenerator, Optional
 from collections import Counter
 import uuid
 import math
+from threading import Lock
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.settings import (CommonSettings, ExecutorSettingsBase)
@@ -56,13 +57,15 @@ common_settings = CommonSettings(
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
     # wait a bit until qstat has job info available
-    init_seconds_before_status_checks=20,
+    init_seconds_before_status_checks=120,
     pass_group_args=True,
 )
 
 class Executor(RemoteExecutor):
     def __post_init__(self):
         self.run_uuid = str(uuid.uuid4())
+        self.last_submission_time = 0  # Initialize the last submission time
+        self.last_submission_lock = Lock()
         self._fallback_project_arg = None
         self._fallback_queue = None
         self.sge_jobid = None
@@ -126,7 +129,7 @@ class Executor(RemoteExecutor):
         # filtering in the job status checks
 
         call = f"qsub -shell y -o {sge_logfile} -e {sge_logfile} -N '{jobname}'"
-        
+
         # Extracting time_min and converting if necessary
         time_min = job.resources.get('time_min')
 
@@ -170,22 +173,38 @@ class Executor(RemoteExecutor):
 
         self.logger.debug(f"qsub call: {call}")
         #print(f"qsub call: {call}")
-        try:
-            out = subprocess.check_output(
-                call, shell=True, text=True, stderr=subprocess.STDOUT
-            ).strip()
-        except subprocess.CalledProcessError as e:
-            raise WorkflowError(
-                f"sge job submission failed. The error message was {e.output}"
-            )
-        
-        print(out)
 
-        sge_jobid = re.search(r"Your job (\d+) [(]", out)[1]
-        if not sge_jobid:
+        # *** Add the time delay code here ***
+        with self.last_submission_lock:
+            current_time = time.time()
+            time_since_last_submission = current_time - self.last_submission_time
+            if time_since_last_submission < 1:
+                sleep_duration = 1 - time_since_last_submission
+                self.logger.debug(f"Sleeping for {sleep_duration:.2f} seconds to enforce one job per second submission rate.")
+                time.sleep(sleep_duration)
+
+            # Proceed with job submission
+            try:
+                out = subprocess.check_output(
+                    call, shell=True, text=True, stderr=subprocess.STDOUT
+                ).strip()
+            except subprocess.CalledProcessError as e:
+                raise WorkflowError(
+                    f"sge job submission failed. The error message was {e.output}"
+                )
+
+            # Update the last submission time
+            self.last_submission_time = time.time()
+
+        # *** Corrected extraction of sge_jobid ***
+        match = re.search(r"Your job (\d+)", out)
+        if match:
+            sge_jobid = match.group(1)
+        else:
             raise WorkflowError(
                 f"Could not extract sge job ID. The submission message was\n{out}"
             )
+
         sge_logfile = sge_logfile.replace("%J", sge_jobid)
         self.logger.info(
             f"Job {job.jobid} has been submitted with sge jobid {sge_jobid} "
@@ -220,7 +239,7 @@ class Executor(RemoteExecutor):
 
         job_query_durations = []
 
-        status_attempts = 6
+        status_attempts = 10
 
         active_jobs_ids = {job_info.external_jobid for job_info in active_jobs}
         active_jobs_seen = set()
@@ -318,7 +337,7 @@ class Executor(RemoteExecutor):
                     f"qdel {jobids}",
                     text=True,
                     shell=True,
-                    timeout=60,
+                    timeout=600,
                     stderr=subprocess.PIPE,
                 )
                 self.logger.info(f"Cancelled jobs {jobids}")
