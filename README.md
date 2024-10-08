@@ -8,7 +8,7 @@ This plugin allows Snakemake to submit jobs to an SGE (Sun Grid Engine) cluster,
 
 Before you begin, ensure that you have the following installed:
 
-	•	Python 3.7 or higher
+	•	Python 3.11 or higher
 	•	snakemake
 	•	Poetry (for managing dependencies)
  
