@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.0.0 (2024-10-10)
+
+
+### Bug Fixes
+
+* adapt to API change in snakemake-interface-executor-plugins ([c56d011](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/c56d011a86837637b1b1cf8eaf74fe9d9378f622))
+* adapt to API changes ([6704e91](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/6704e918112b590df572a0c9a5650313a183db82))
+* adapt to breaking changes in snakemake-interface-executor-plugins ([ffd6418](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/ffd641814720e1a03d07f9a2c359959bde2714bd))
+* adapt to changes in interface ([cfda732](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/cfda732b58714e6a077097cb059c31241a6f4839))
+* adapt to interface changes ([eace99a](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/eace99a86386395040bc2bca7bfe713df7573625))
+* adapt to interface changes ([67b5850](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/67b58505c7353e1e08e703a5d4d2f449ae7c1659))
+* add license file ([aadd97d](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/aadd97dcd9b6dba4bc84ee0aaf81a7b25bbb8729))
+* API usage ([14375f6](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/14375f6a032a59f0509f48089f327845c840fa38))
+* depend on latest executor interface ([cd0faad](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/cd0faadd1f16bf140324342864a3061880fc3c41))
+* mark submit_cmd as required ([cf13733](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/cf13733ae16682e5995a28e19cd51afd2cc1c4ef))
+* Update __init__.py ([#11](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/issues/11)) ([0827378](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/08273784b2c100fbeef9881621df36ac69ceb7ed))
+* update deps ([2c0bb45](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/2c0bb45119d6059da4ec09032ff6442d63da4140))
+* update to latest interfaces ([97130fe](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/97130fe01ec79cb6c656046a5efb64fd192f3681))
+
+
+### Performance Improvements
+
+* bump snakemake-interface-executor-plugins dependency ([3d686c1](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/3d686c1d6a656848c2ce91c0da5b111349bdc391))
+
+
+### Documentation
+
+* update metadata ([d3435f8](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/d3435f82cfa78c492f7308cd8b6c156076c41643))
+
+
+### Miscellaneous Chores
+
+* release 1.0.0 ([3462020](https://github.com/AndrewsLabUCSF/snakemake-executor-plugin-sge-wynton/commit/3462020c78f312b1e3e4072cad940da46d68d65d))
+
 ## [1.0.9](https://github.com/snakemake/snakemake-executor-plugin-cluster-generic/compare/v1.0.8...v1.0.9) (2024-03-11)
 
 

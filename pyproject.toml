@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "snakemake-executor-plugin-sge-wynton"
-version = "1.0.9"
+version = "1.0.0"
 description = ""
 authors = ["Johannes Koester <johannes.koester@uni-due.de>"]
 readme = "README.md"
