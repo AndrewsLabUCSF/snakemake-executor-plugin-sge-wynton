@@ -9,6 +9,9 @@ __copyright__ = (
 __email__ = "johannes.koester@uni-due.de"
 __license__ = "MIT"
 
+"""
+command to run the plugin: snakemake -j 2 --executor sge-wynton --use-conda --use-singularity -F --max-jobs-per-second 1
+"""
 import os
 import re
 import subprocess
@@ -64,7 +67,7 @@ common_settings = CommonSettings(
 class Executor(RemoteExecutor):
     def __post_init__(self):
         self.run_uuid = str(uuid.uuid4())
-        self.last_submission_time = 0  # Initialize the last submission time
+        #self.last_submission_time = 0  # Initialize the last submission time
         self.last_submission_lock = Lock()
         self._fallback_project_arg = None
         self._fallback_queue = None
@@ -174,27 +177,29 @@ class Executor(RemoteExecutor):
         self.logger.debug(f"qsub call: {call}")
         #print(f"qsub call: {call}")
 
-        # *** Add the time delay code here ***
-        with self.last_submission_lock:
-            current_time = time.time()
-            time_since_last_submission = current_time - self.last_submission_time
-            if time_since_last_submission < 1:
-                sleep_duration = 1 - time_since_last_submission
-                self.logger.debug(f"Sleeping for {sleep_duration:.2f} seconds to enforce one job per second submission rate.")
-                time.sleep(sleep_duration)
 
-            # Proceed with job submission
-            try:
-                out = subprocess.check_output(
-                    call, shell=True, text=True, stderr=subprocess.STDOUT
-                ).strip()
-            except subprocess.CalledProcessError as e:
-                raise WorkflowError(
-                    f"sge job submission failed. The error message was {e.output}"
-                )
+        # *** Add the time delay code here *** Using the --max-jobs-per-second 1 flag instead
+        #with self.last_submission_lock:
+            #current_time = time.time()
+            #time_since_last_submission = current_time - self.last_submission_time
+            #if time_since_last_submission < 1:
+              #  sleep_duration = 1 - time_since_last_submission
+             #   self.logger.debug(f"Sleeping for {sleep_duration:.2f} seconds to enforce one job per second submission rate.")
+             #   time.sleep(sleep_duration)
+
+        # Proceed with job submission
+        try:
+            out = subprocess.check_output(
+                call, shell=True, text=True, stderr=subprocess.STDOUT
+            ).strip()
+        except subprocess.CalledProcessError as e:
+            raise WorkflowError(
+                f"sge job submission failed. The error message was {e.output}"
+            )
+        print(out)
 
             # Update the last submission time
-            self.last_submission_time = time.time()
+            #self.last_submission_time = time.time()
 
         # *** Corrected extraction of sge_jobid ***
         match = re.search(r"Your job (\d+)", out)
@@ -261,11 +266,11 @@ class Executor(RemoteExecutor):
                 missing_status_ever = active_jobs_ids - active_jobs_seen
                 if missing_status_ever and i > 2:
                     (
-                        status_of_jobs_sgeevt,
+                        status_of_jobs_qacct,
                         job_query_duration,
                     ) = await self.job_stati_qacct()
                     job_query_durations.append(job_query_duration)
-                    status_of_jobs.update(status_of_jobs_sgeevt)
+                    status_of_jobs.update(status_of_jobs_qacct)
                     self.logger.debug(
                         f"status_of_jobs after qacct is: {status_of_jobs}"
                     )
@@ -286,8 +291,8 @@ class Executor(RemoteExecutor):
                     f"Unable to get the status of all active_jobs that should be "
                     f"in sge, even after {status_attempts} attempts.\n"
                     f"The jobs with the following job ids were previously seen "
-                    "but are no longer reported by qstat or in sge_EVENTS:\n"
-                    f"{missing_status}\n"
+                    "but are no longer reported by qstat or in qacct:\n"
+                    f"{missing_status_ever}\n"
                     f"Please double-check with your sge cluster administrator, that "
                     "job accounting is properly set up.\n"
                 )
@@ -383,7 +388,7 @@ class Executor(RemoteExecutor):
                 job_info = qstat_dict.get("job_info", {}).get("job_info", {})
                 
                 if not job_info:
-                    self.logger.warning("job_info is empty in qstat response.")
+                    #self.logger.warning("job_info is empty in qstat response.")
                     pending_jobs = []
                 else:
                     pending_jobs = job_info.get("job_list", [])
