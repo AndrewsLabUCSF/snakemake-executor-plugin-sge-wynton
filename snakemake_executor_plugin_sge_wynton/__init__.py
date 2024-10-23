@@ -60,15 +60,13 @@ common_settings = CommonSettings(
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
     # wait a bit until qstat has job info available
-    init_seconds_before_status_checks=120,
+    init_seconds_before_status_checks=240,
     pass_group_args=True,
 )
 
 class Executor(RemoteExecutor):
     def __post_init__(self):
         self.run_uuid = str(uuid.uuid4())
-        #self.last_submission_time = 0  # Initialize the last submission time
-        self.last_submission_lock = Lock()
         self._fallback_project_arg = None
         self._fallback_queue = None
         self.sge_jobid = None
@@ -127,10 +125,6 @@ class Executor(RemoteExecutor):
 
         os.makedirs(os.path.dirname(sge_logfile), exist_ok=True)
 
-        # generic part of a submission string:
-        # we use a run_uuid in the job-name, to allow `--name`-based
-        # filtering in the job status checks
-
         call = f"qsub -shell y -o {sge_logfile} -e {sge_logfile} -N '{jobname}'"
 
         # Extracting time_min and converting if necessary
@@ -175,19 +169,7 @@ class Executor(RemoteExecutor):
         #call += f' "{exec_job}"'
 
         self.logger.debug(f"qsub call: {call}")
-        #print(f"qsub call: {call}")
 
-
-        # *** Add the time delay code here *** Using the --max-jobs-per-second 1 flag instead
-        #with self.last_submission_lock:
-            #current_time = time.time()
-            #time_since_last_submission = current_time - self.last_submission_time
-            #if time_since_last_submission < 1:
-              #  sleep_duration = 1 - time_since_last_submission
-             #   self.logger.debug(f"Sleeping for {sleep_duration:.2f} seconds to enforce one job per second submission rate.")
-             #   time.sleep(sleep_duration)
-
-        # Proceed with job submission
         try:
             out = subprocess.check_output(
                 call, shell=True, text=True, stderr=subprocess.STDOUT
@@ -197,9 +179,6 @@ class Executor(RemoteExecutor):
                 f"sge job submission failed. The error message was {e.output}"
             )
         print(out)
-
-            # Update the last submission time
-            #self.last_submission_time = time.time()
 
         # *** Corrected extraction of sge_jobid ***
         match = re.search(r"Your job (\d+)", out)
