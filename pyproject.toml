@@ -13,7 +13,7 @@ keywords = ["snakemake", "plugin", "executor", "cluster"]
 python = "^3.11"
 snakemake-interface-executor-plugins = "^9.0.0"
 snakemake-interface-common = "^1.13.0"
-xmltodict = "^0.13.0"
+xmltodict = "^0.14.2"
 
 [tool.poetry.group.dev.dependencies]
 snakemake = {git = "https://github.com/snakemake/snakemake.git", branch = "main"}
