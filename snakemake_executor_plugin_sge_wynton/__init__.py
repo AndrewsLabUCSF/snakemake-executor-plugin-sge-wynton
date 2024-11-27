@@ -128,18 +128,24 @@ class Executor(RemoteExecutor):
         call = f"qsub -shell y -o {sge_logfile} -e {sge_logfile} -N '{jobname}'"
 
         # Extracting time_min and converting if necessary
-        time_min = job.resources.get('time_min')
+        time_min = job.resources.get('time_min', 60)
+        if time_min is not None:
+            try:
+                time_sge = walltime_sge_to_generic(time_min)
+            except ValueError as e:
+                raise WorkflowError(f"Invalid time_min format: {time_min}. Error: {e}")
+        else:
+            raise WorkflowError("Missing time_min resources for the job.")
 
         # Check if time_min is provided as a string in the format HH:MM:SS
-        if isinstance(time_min, str):
-            time_sge = time_min  # Use the time as-is
-        elif isinstance(time_min, (int, float)):
+        #if isinstance(time_min, str):
+         #   time_sge = time_min  # Use the time as-is
+        #elif isinstance(time_min, (int, float)):
             # Convert time_min in minutes to HH:MM:SS format
-            hours, minutes = divmod(int(time_min), 60)
-            seconds = int((time_min - int(time_min)) * 60)
-            time_sge = f"{hours:02}:{minutes:02}:{seconds:02}"
-        else:
-            raise WorkflowError("Invalid time_min format. Expected a string 'HH:MM:SS' or a numeric value representing minutes.")
+         #   hours, minutes = divmod(int(time_min), 60)
+          #  seconds = int((time_min - int(time_min)) * 60)
+           # time_sge = f"{hours:02}:{minutes:02}:{seconds:02}"
+        ##   raise WorkflowError("Invalid time_min format. Expected a string 'HH:MM:SS' or a numeric value representing minutes.")
 
         # Append time to the call in the format 'HH:MM:SS'
         call += f" -l h_rt={time_sge}"
@@ -219,7 +225,7 @@ class Executor(RemoteExecutor):
         #    # query remote middleware here
         fail_stati = ("EXIT")
         # Cap sleeping time between querying the status of all active jobs:
-        max_sleep_time = 180
+        max_sleep_time = 360
 
         job_query_durations = []
 
@@ -321,7 +327,7 @@ class Executor(RemoteExecutor):
                     f"qdel {jobids}",
                     text=True,
                     shell=True,
-                    timeout=600,
+                    timeout=1200,
                     stderr=subprocess.PIPE,
                 )
                 self.logger.info(f"Cancelled jobs {jobids}")
@@ -581,36 +587,39 @@ def format_job_exec(self, job: JobExecutorInterface):
 
 def walltime_sge_to_generic(w):
     """
-    convert old sge walltime format to new generic format
+    Convert walltime to the generic HH:MM:SS format required by SGE.
     """
-    s = 0
-    if type(w) in [int, float]:
-        # convert int minutes to hours minutes and seconds
-        return w
-    elif type(w) is str:
+    if isinstance(w, (int, float)):
+        # Convert numeric minutes to HH:MM:SS
+        h, m = divmod(int(w), 60)
+        s = 0
+        return f"{h:02}:{m:02}:{s:02}"
+    elif isinstance(w, str):
         if re.match(r"^\d+(ms|[smhdw])$", w):
             return w
         elif re.match(r"^\d+:\d+$", w):
-            # convert "HH:MM" to hours and minutes
-            h, m = map(float, w.split(":"))
+            # Convert "HH:MM" to "HH:MM:SS"
+            h, m = map(int, w.split(":"))
+            s = 0
+            return f"{h:02}:{m:02}:{s:02}"
         elif re.match(r"^\d+:\d+:\d+$", w):
-            # convert "HH:MM:SS" to hours minutes and seconds
-            h, m, s = map(float, w.split(":"))
-        elif re.match(r"^\d+:\d+\.\d+$", w):
-            # convert "HH:MM.XX" to hours minutes and seconds
-            h, m = map(float, w.split(":"))
-            s = (m % 1) * 60
-            m = round(m)
+            # Already in "HH:MM:SS", return as-is
+            return w
         elif re.match(r"^\d+\.\d+$", w):
-            return math.ceil(w)
+            # Convert decimal minutes to HH:MM:SS
+            total_minutes = float(w)
+            h, m = divmod(int(total_minutes), 60)
+            s = int((total_minutes - int(total_minutes)) * 60)
+            return f"{h:02}:{m:02}:{s:02}"
         elif re.match(r"^\d+$", w):
-            return int(w)
+            # Plain numeric string, treat as minutes
+            h, m = divmod(int(w), 60)
+            s = 0
+            return f"{h:02}:{m:02}:{s:02}"
         else:
             raise ValueError(f"Invalid walltime format: {w}")
-    h = int(h)
-    m = int(m)
-    s = int(s)
-    return math.ceil((h * 60) + m + (s / 60))
+    else:
+        raise ValueError(f"Unsupported type for walltime: {type(w)}")
 
 
 def generalize_sge(rules, runtime=True, memory="perthread_to_perjob"):
