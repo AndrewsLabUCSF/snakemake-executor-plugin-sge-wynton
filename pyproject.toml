@@ -10,7 +10,7 @@ documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/ex
 keywords = ["snakemake", "plugin", "executor", "cluster"]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.12"
 snakemake-interface-executor-plugins = "^9.0.0"
 snakemake-interface-common = "^1.13.0"
 xmltodict = "^0.13.0"

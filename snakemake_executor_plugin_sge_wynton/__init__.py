@@ -447,7 +447,7 @@ class Executor(RemoteExecutor):
             self.logger.debug(
                 f"The job status for completed jobs was queried.\n"
                 f"It took: {query_duration} seconds\n"
-                f"The output is:\n'{"finished",finished}'\n"
+                f"The output is:\n' finished: {finished}'\n"
             )
             if finished:
                 statuses_all = [(p[0], get_status(p[1])) for p in (line.split() for line in finished.split("\n")) if len(p) >= 2]
