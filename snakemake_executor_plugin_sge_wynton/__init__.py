@@ -60,7 +60,7 @@ common_settings = CommonSettings(
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
     # wait a bit until qstat has job info available
-    init_seconds_before_status_checks=240,
+    init_seconds_before_status_checks=3600,
     pass_group_args=True,
 )
 
@@ -223,9 +223,9 @@ class Executor(RemoteExecutor):
         #
         # async with self.status_rate_limiter:
         #    # query remote middleware here
-        fail_stati = ("EXIT")
+        fail_stati = ("EXIT", "Eqw")
         # Cap sleeping time between querying the status of all active jobs:
-        max_sleep_time = 360
+        max_sleep_time = 3600
 
         job_query_durations = []
 
@@ -271,19 +271,29 @@ class Executor(RemoteExecutor):
                 self.logger.debug(f"active_jobs_seen are: {active_jobs_seen}")
                 if not missing_status and not missing_status_ever:
                     break
-            if i >= status_attempts - 1 and missing_status_ever:
-                self.logger.warning(
-                    f"Unable to get the status of all active_jobs that should be "
-                    f"in sge, even after {status_attempts} attempts.\n"
-                    f"The jobs with the following job ids were previously seen "
-                    "but are no longer reported by qstat or in qacct:\n"
-                    f"{missing_status_ever}\n"
-                    f"Please double-check with your sge cluster administrator, that "
-                    "job accounting is properly set up.\n"
-                )
-                for j in active_jobs:
-                    if j.external_jobid in missing_status_ever:
-                        self.cancel_jobs([j])
+                if i >= status_attempts - 1 and missing_status_ever:
+                    # Check if jobs are still in the queue (qw state)
+                    still_queued = {job.external_jobid for job in active_jobs if status_of_jobs.get(job.external_jobid) == "qw"}
+
+                    if still_queued:
+                        self.logger.info(f"Jobs still in queue: {still_queued}. Waiting longer instead of canceling...")
+                        continue  # Don't cancel if jobs are still waiting in queue
+
+                    # Log missing jobs before canceling
+                    self.logger.warning(
+                        f"Unable to get the status of all active jobs that should be "
+                        f"in SGE, even after {status_attempts} attempts.\n"
+                        f"The jobs with the following job IDs were previously seen "
+                        "but are no longer reported by `qstat` or `qacct`:\n"
+                        f"{missing_status_ever}\n"
+                        f"Please double-check with your SGE cluster administrator that "
+                        "job accounting is properly set up.\n"
+                    )
+
+                    # Now cancel only if missing jobs are truly not reported anywhere
+                    for j in active_jobs:
+                        if j.external_jobid in missing_status_ever:
+                            self.cancel_jobs([j])
 
         any_finished = False
         for j in active_jobs:
@@ -307,7 +317,7 @@ class Executor(RemoteExecutor):
 
         if not any_finished:
             self.next_seconds_between_status_checks = min(
-                self.next_seconds_between_status_checks + 10, max_sleep_time
+                self.next_seconds_between_status_checks + 300, max_sleep_time
             )
         else:
             self.next_seconds_between_status_checks = None
@@ -391,7 +401,7 @@ class Executor(RemoteExecutor):
                  #   job_list = [job_list]
 
                 qstat_jobs = {x['JB_job_number']: {"name": x["JB_name"], "state": x["@state"]}
-                            for x in job_list}
+                            for x in job_list if x["@state"] in ("r", "qw")}
 
                 # Filter jobs based on UUID in the job name
                 res = {k: v["state"] for k, v in qstat_jobs.items() if re.search(uuid, v["name"])}
