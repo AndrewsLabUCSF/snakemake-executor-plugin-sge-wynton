@@ -60,7 +60,7 @@ common_settings = CommonSettings(
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
     # wait a bit until qstat has job info available
-    init_seconds_before_status_checks=3600,
+    init_seconds_before_status_checks=600,
     pass_group_args=True,
 )
 
@@ -225,11 +225,11 @@ class Executor(RemoteExecutor):
         #    # query remote middleware here
         fail_stati = ("EXIT", "Eqw")
         # Cap sleeping time between querying the status of all active jobs:
-        max_sleep_time = 3600
+        max_sleep_time = 1800
 
         job_query_durations = []
 
-        status_attempts = 10
+        status_attempts = 30
 
         active_jobs_ids = {job_info.external_jobid for job_info in active_jobs}
         active_jobs_seen = set()
@@ -249,7 +249,7 @@ class Executor(RemoteExecutor):
                     active_jobs_seen | active_jobs_ids_with_current_status
                 )
                 missing_status_ever = active_jobs_ids - active_jobs_seen
-                if missing_status_ever and i > 2:
+                if missing_status_ever and i > 3:
                     (
                         status_of_jobs_qacct,
                         job_query_duration,
@@ -337,7 +337,7 @@ class Executor(RemoteExecutor):
                     f"qdel {jobids}",
                     text=True,
                     shell=True,
-                    timeout=1200,
+                    timeout=300,
                     stderr=subprocess.PIPE,
                 )
                 self.logger.info(f"Cancelled jobs {jobids}")
