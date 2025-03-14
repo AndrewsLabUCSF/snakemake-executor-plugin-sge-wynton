@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import time
+import asyncio
 import xmltodict
 from dataclasses import dataclass, field
 from typing import List, AsyncGenerator, Optional
@@ -60,7 +61,7 @@ common_settings = CommonSettings(
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
     # wait a bit until qstat has job info available
-    init_seconds_before_status_checks=300,
+    init_seconds_before_status_checks=1800,
     pass_group_args=True,
 )
 
@@ -70,6 +71,7 @@ class Executor(RemoteExecutor):
         self._fallback_project_arg = None
         self._fallback_queue = None
         self.sge_jobid = None
+        self.fallback_cancel_on_missing = False
         # Initialize sge_config
         sge_root = os.getenv('SGE_ROOT')
         sge_cell = os.getenv('SGE_CELL')
@@ -225,7 +227,7 @@ class Executor(RemoteExecutor):
         #    # query remote middleware here
         fail_stati = ("EXIT", "Eqw")
         # Cap sleeping time between querying the status of all active jobs:
-        max_sleep_time = 3600
+        max_sleep_time = 600
 
         job_query_durations = []
 
@@ -276,8 +278,12 @@ class Executor(RemoteExecutor):
 
                     if still_queued:
                         self.logger.info(f"Jobs still in queue: {still_queued}. Waiting longer instead of canceling...")
-                        continue  # Don't cancel if jobs are still waiting in queue
-
+                        # Increase the wait time more aggressively for queued jobs.
+                        self.next_seconds_between_status_checks = min(
+                            (self.next_seconds_between_status_checks or 300) + 300, max_sleep_time
+                        )
+                        # Skip further processing in this iteration, so we wait longer.
+                        continue
                     # Log missing jobs before canceling
                     self.logger.warning(
                         f"Unable to get the status of all active jobs that should be "
@@ -292,7 +298,14 @@ class Executor(RemoteExecutor):
                     # Now cancel only if missing jobs are truly not reported anywhere
                     for j in active_jobs:
                         if j.external_jobid in missing_status_ever:
-                            self.cancel_jobs([j])
+                            msg = f"SGE job '{j.external_jobid}' status unknown after maximum attempts."
+                            self.report_job_error(j, msg=msg, aux_logs=[j.aux['sge_logfile']])
+
+                    # Fallback: if configured, cancel missing jobs instead of just erroring them.
+                    if getattr(self, 'fallback_cancel_on_missing', False):
+                        self.logger.info(f"Fallback enabled: Canceling missing jobs {missing_status_ever}.")
+                        self.cancel_jobs([j for j in active_jobs if j.external_jobid in missing_status_ever])
+                    break
 
         any_finished = False
         for j in active_jobs:
@@ -336,7 +349,7 @@ class Executor(RemoteExecutor):
                     f"qdel {jobids}",
                     text=True,
                     shell=True,
-                    timeout=300,
+                    timeout=1800,
                     stderr=subprocess.PIPE,
                 )
                 self.logger.info(f"Cancelled jobs {jobids}")
@@ -394,7 +407,7 @@ class Executor(RemoteExecutor):
                 # Now concatenate running and pending jobs
                 job_list = running_jobs + pending_jobs
                     #job_list = qstat_dict.get("job_info", {}).get("job_info", {}).get("job_list", [])
-                time.sleep(30)
+                await asyncio.sleep(30)
                 # If there's only one job, ensure job_list is treated as a list
                 #if isinstance(job_list, dict):
                  #   job_list = [job_list]
@@ -409,7 +422,6 @@ class Executor(RemoteExecutor):
                 f"The running job status query failed with command: {running_cmd}\n"
                 f"Error message: {e.stderr.strip()}\n"
             )
-            pass
         return (res, query_duration)
 
     async def job_stati_qacct(self):
@@ -466,7 +478,6 @@ class Executor(RemoteExecutor):
                 f"The finished job status query failed with command: {awk_code}\n"
                 f"Error message: {e.stderr.strip()}\n"
             )
-            pass
 
         res = {x[0]: x[1] for x in statuses_all if len(x) > 1}
         return (res, query_duration)
