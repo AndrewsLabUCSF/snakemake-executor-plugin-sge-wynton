@@ -61,7 +61,7 @@ common_settings = CommonSettings(
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
     # wait a bit until qstat has job info available
-    init_seconds_before_status_checks=1800,
+    init_seconds_before_status_checks=1200,
     pass_group_args=True,
 )
 
