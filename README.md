@@ -24,7 +24,6 @@ Before you begin, ensure that you have the following installed
 ## Installation
 
 <aside>
-💡
 
 Remember to do this inside the conda environment so it doesn’t effect other installations you already have
 
