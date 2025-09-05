@@ -172,6 +172,10 @@ class Executor(RemoteExecutor):
 
         # ensure that workdir is set correctly
         call += f" -cwd {jobscript}"
+
+        # force all temps into /scratch/$USER
+        call += " -v TMPDIR=/scratch/$USER,SNAKEMAKE_TMPDIR=/scratch/$USER"
+
         # and finally the job to execute with all the snakemake parameters
         # TODO do I need an equivalent to --wrap?
         #call += f' "{exec_job}"'
